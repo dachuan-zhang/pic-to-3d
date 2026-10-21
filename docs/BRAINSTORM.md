@@ -22,7 +22,7 @@ room-box assembly**, not fused watertight reconstruction. The PoC's job is to *m
 that ceiling, not to assume it away.
 
 **Status:** v0 built. Schema, geometry, room-box fit, door detection, global assembly, metrics
-and an editable viewer are implemented and tested (81 tests). A deterministic stub backend runs
+and an editable viewer are implemented and tested (92 tests). A deterministic stub backend runs
 the whole chain end-to-end with no GPU (§15). Real model backends (VGGT, depth) are typed
 wiring; room clustering is deliberately not implemented yet.
 
@@ -233,8 +233,8 @@ VLM ("kitchen adjacent to living room"), scored against ZInD.
 |---|---|---|
 | 0 | This doc, schema, geometry + assembly + eval libraries, stub end-to-end | **done** |
 | 1 | Viewer: editable 2D floorplan + extruded 3D walk | **done (v0)** |
-| 2 | Wire a real poses backend (VGGT or hosted) + depth, cache | **next** |
-| 3 | ZInD ingest + eval vs. published baselines | next |
+| 2 | Real depth backend (ONNX, no torch) + cache | **done** |
+| 3 | Real-data eval vs. ground truth ▶ ZInD is gated; used NYU Depth V2 instead (§15b) | **done** |
 | 4 | Room clustering / identity from flat listing photos | next |
 | 5 | Door detection upgraded (segmentation / VLM) | next |
 | 6 | Depth-parallax 2.5D upgrade per room | later |
@@ -326,7 +326,7 @@ tests/                 geometry, openings, assembly, eval, schema, end-to-end
 
 ---
 
-## 15. v0 baseline (measured)
+## 15. v0 baselines (measured)
 
 Synthetic two-room house, `python -m pin3d.cli stub`. **This validates the plumbing, not the
 tech on real photos** — it is the number the real arm will be compared against.
@@ -371,11 +371,60 @@ environment):
    plus a verified-by-headless-test renderer beats a better renderer that might not start.
 7. **Error overlays must print the real exception.** Both failures were misdiagnosed because
    the catch block substituted a plausible story for `err.message`.
+8. **Do not choose an evaluation convention per sample.** Letting each scene pick "depth vs
+   disparity" whichever scored better turned an honest 0.171 into an inflated number and hid
+   the fact that 34/80 scenes were being fit through a reciprocal. Choose it once, globally,
+   and report both scores.
+
+### 15b. Real photos, real depth (NYU Depth V2, 150 rooms)
+
+ZInD turned out to be **gated** (the public S3 bucket 404s; access needs an accepted
+agreement), so the real arm uses **NYU Depth V2** via a HuggingFace mirror: 480x640 RGB with
+float32 metric depth, 171 distinct rooms among the first 200 frames. Model: **Depth Anything V2
+Small, ONNX, on CoreML/CPU** — no torch, 150 rooms in 95 s.
+
+Depth is affine-invariant, so it is aligned to ground truth before measuring (scale+shift), and
+the output convention is chosen **once globally** — choosing it per image is overfitting a
+flexible transform, and doing so flipped 34/80 scenes to a reciprocal fit and silently
+flattered the numbers.
+
+| metric | value |
+|---|---|
+| AbsRel (affine-aligned) | **0.171** |
+| RMSE | 0.688 m |
+| delta<1.25 / delta<1.25^2 | 0.813 / 0.937 |
+| output convention | depth (0.171) beats disparity (0.204) |
+| room box solved | 100% (GT depth and model depth) |
+| room area | GT 17.1 m² vs model 12.5 m² → **29% relative error** |
+| wall support / confidence | GT 0.400 vs model 0.403 |
+| ceiling observable from **one** view | **0 / 150 scenes** |
+
+Four findings, in order of how much they change the plan:
+
+1. **The depth model is good enough to be useful.** 17% AbsRel on real rooms is roughly a
+   17 cm error on a 1 m object, and it costs 0.6 s/room on CPU. This is not the bottleneck.
+2. **Extent geometry amplifies depth error.** 17% depth error becomes 29% room-area error,
+   because a box is defined by the extreme points and inherits the error tail. Median-based
+   wall-plane estimation mitigates but cannot remove this.
+3. **Ceiling height is not recoverable from one view.** Not one of 150 real single frames had
+   ≥5% of its points on a top plane. The NYU captures are often tilted down, and ceilings are
+   joists or out of frame. Any single-view "ceiling height" is measuring the top of the
+   frustum, so the harness now refuses to report it (`ceiling_valid`) and the exported plans
+   say `"ceiling_source": "assumed 2.7 m"` rather than inventing one.
+4. **The model looks more confident than the ground truth.** On the exported scenes the model's
+   boxes score 0.44–0.48 wall support against GT's 0.33–0.38, *while being 5–6 m² smaller*.
+   Smoother depth produces a tidier fit without being more correct — this is §6's "fails
+   plausibly" trap, now a measured number rather than a warning.
+
+**Net:** the theorem in §6 holds up on real data. Model quality is no longer the constraint;
+**capture geometry is.** Level 2 (room box) is sound, but it requires multiple views per room —
+a single frame cannot close a room, see its ceiling, or separate it from the room next door.
 
 ## 16. Open questions
 
-1. **Compute** — GPU available locally, or target a hosted endpoint (Replicate/fal) for
-   VGGT and depth? *(unanswered; current code assumes nothing)*
+1. **Compute** — partially answered: depth needs no GPU (ONNX on CoreML/CPU, 0.6 s/room). Still
+   open for the *poses* backend (VGGT), which will want a GPU or a hosted endpoint.
+   *(user has not answered; current code assumes nothing)*
 2. **Deliverable shape** — interactive web viewer vs. pre-rendered MP4 walkthroughs? Videos
    are much easier to A/B and to show people.
 3. Is the real product **self-serve on arbitrary user photos** (must be fully automatic) or a

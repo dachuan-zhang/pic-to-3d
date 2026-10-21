@@ -21,6 +21,15 @@ from .eval.metrics import evaluate, format_report
 from .geometry import ensure_ccw, wall_segments
 from .pipeline.openings import GapOpeningDetector
 from .pipeline.poses import StubBackend, StubScene, get_backend, load_or_estimate
+from .pipeline.depth import OnnxDepth
+from .pipeline.real import (
+    Sample,
+    floorplan_from_geometry,
+    format_aggregate,
+    iter_nyu_h5,
+    iter_nyu_parquet,
+    run_experiment,
+)
 from .pipeline.reconstruct import reconstruct
 from .schema import Floorplan, Opening, Room
 
@@ -193,6 +202,61 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_real(args: argparse.Namespace) -> int:
+    """Run the geometry stack on real photos with ground-truth depth (NYU Depth V2)."""
+    if args.h5_dir:
+        samples = list(iter_nyu_h5(args.h5_dir, limit=args.limit))
+    elif args.parquet:
+        samples = list(iter_nyu_parquet(args.parquet, limit=args.limit))
+    else:
+        print("need --parquet <file> or --h5-dir <dir>", file=sys.stderr)
+        return 2
+    if not samples:
+        print("no samples loaded", file=sys.stderr)
+        return 2
+
+    first = samples[0]
+    print(f"{len(samples)} real scenes from NYU Depth V2 "
+          f"({first.rgb.shape[1]}x{first.rgb.shape[0]} RGB + metric depth)")
+    model = OnnxDepth(path=args.model)
+    print(f"depth model: {model.info.path} on {','.join(model.info.providers)}")
+
+    result = run_experiment(samples, model, verbose=not args.quiet)
+    agg = result["aggregate"]
+
+    print()
+    print(format_aggregate(agg))
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "summary.json").write_text(json.dumps(
+        {"aggregate": agg, "rows": [r.as_dict() for r in result["rows"]]}, indent=2))
+    print(f"\nwrote {out / 'summary.json'}")
+
+    # export the best-supported single-view reconstructions for the viewer (A/B: GT vs model)
+    ranked = sorted(
+        result["rows"],
+        key=lambda r: ((r.gt_geom or {}).get("confidence", 0.0) + (r.pred_geom or {}).get("confidence", 0.0)),
+        reverse=True,
+    )
+    exported = 0
+    for row in ranked:
+        if exported >= args.export:
+            break
+        for tag, geom in (("gt", row.gt_geom), ("model", row.pred_geom)):
+            if geom is None:
+                continue
+            plan = floorplan_from_geometry(geom, row.name, f"nyu_{tag}")
+            path = out / f"scene{exported:02d}_{tag}.json"
+            plan.save(str(path))
+            print(f"wrote {path}")
+        exported += 1
+    if exported:
+        print(f"\nview one with:\n  python3 -m http.server 8000")
+        print(f"  open 'http://localhost:8000/viewer/floorplan.html?src=../{out}/scene00_gt.json'")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pin3d", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -222,6 +286,16 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--door-radius", type=float, default=0.5)
     e.add_argument("--json", action="store_true")
     e.set_defaults(func=cmd_eval)
+
+    r = sub.add_parser("real", help="real photos + ground-truth depth (NYU Depth V2)")
+    r.add_argument("--parquet", default=None, help="NYU depth_v2 parquet shard")
+    r.add_argument("--h5-dir", default=None, help="directory of NYU labelled .h5 files")
+    r.add_argument("--model", default="models/depth_anything_v2_small.onnx")
+    r.add_argument("--limit", type=int, default=40)
+    r.add_argument("--out", default="out/real")
+    r.add_argument("--export", type=int, default=3, help="single-view plans to export")
+    r.add_argument("--quiet", action="store_true")
+    r.set_defaults(func=cmd_real)
 
     v = sub.add_parser("validate", help="schema + geometry sanity check")
     v.add_argument("--plan", required=True)

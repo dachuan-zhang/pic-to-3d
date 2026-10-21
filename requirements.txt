@@ -1,3 +1,11 @@
 numpy>=1.24
+
 # Optional: exact polygon IoU on non-convex rooms. Falls back to raster sampling without it.
 shapely>=2.0
+
+# Needed only for the `real` command (real photos + ground-truth depth).
+# Deliberately no torch: the depth model runs on onnxruntime (CoreML/CPU).
+onnxruntime>=1.17
+pillow>=10.0
+pyarrow>=14.0      # NYU Depth V2 parquet shards
+h5py>=3.9          # NYU Depth V2 labelled .h5 files

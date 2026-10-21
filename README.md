@@ -24,7 +24,7 @@ point cloud per room → Manhattan room box → wall-gap doors → global 2D ass
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python -m pin3d.cli stub --out examples      # synthetic house, end to end
-.venv/bin/python -m unittest discover -s tests -t .    # 81 tests
+.venv/bin/python -m unittest discover -s tests -t .    # 92 tests
 
 # viewer needs HTTP (fetch() is blocked on file://)
 python3 -m http.server 8000
@@ -48,10 +48,45 @@ the other:
 That is the pipeline working on a **synthetic** scene. It says nothing about real photos — that
 is the next milestone, and it is the actual experiment.
 
+## Real data (the actual experiment)
+
+ZInD is gated, so the real arm runs on **NYU Depth V2** — 480x640 RGB with float32 **metric**
+depth ground truth — and **Depth Anything V2 Small via ONNX Runtime** (no torch, no GPU).
+
+```bash
+bash scripts/fetch_models.sh          # ~99 MB, once
+.venv/bin/python -m pin3d.cli real --parquet path/to/nyu-shard.parquet --limit 150
+```
+
+Measured on **150 real rooms** (171 distinct rooms among the first 200 frames):
+
+| metric | value |
+|---|---|
+| depth AbsRel (affine-aligned) | 0.171 |
+| depth RMSE / delta<1.25 | 0.688 m / 0.813 |
+| room box solved | 100% |
+| room area, GT vs model | 17.1 m² vs 12.5 m² → **29% error** |
+| ceiling observable from one view | **0 / 150** |
+
+What that says:
+
+- The depth model is **good enough to use** (17% AbsRel, 0.6 s/room on CPU). Not the bottleneck.
+- **Extent geometry amplifies depth error**: 17% depth → 29% area, because a box is defined by
+  its extreme points.
+- **A single view cannot measure ceiling height** — not one of 150 frames had a real top plane.
+  The harness refuses to report it and the exported plans mark the ceiling as assumed.
+- The model scores *higher* wall support than ground truth while producing *smaller* boxes:
+  smoother depth looks better without being more correct.
+
+Which is the design doc's thesis, now measured: **model quality is not the constraint, capture
+geometry is.** Getting real numbers out of one photo per room is not possible; the box needs
+multiple views.
+
 ## Commands
 
 ```bash
 python -m pin3d.cli stub --out examples            # synthetic end-to-end + scored report
+python -m pin3d.cli real --parquet shard.parquet --limit 150   # real photos + GT depth
 python -m pin3d.cli reconstruct --images samples/ --backend stub --out out/plan.json
 python -m pin3d.cli reconstruct --images samples/ --backend vggt  # needs torch + vggt
 python -m pin3d.cli eval    --pred out/plan.json --gt examples/floorplan_gt.json
@@ -88,6 +123,8 @@ beats a 3D scene you cannot fix at all.
 | `VLMDetector` | interface only |
 | ZInD adapter | defensive best-effort; validate against your download |
 | Room clustering / identity from arbitrary photos | **not implemented** (deliberately not faked) |
+| ONNX depth model (Depth Anything V2 Small) | real, exercised on 150 NYU rooms |
+| Real-data evaluation vs. metric GT depth | real (NYU Depth V2) |
 
 ## Known limitations (v0)
 
@@ -99,6 +136,8 @@ beats a 3D scene you cannot fix at all.
   no global least-squares/Bundle adjustment yet. It reports residuals so you can see it struggle.
 - **Ceiling heights** are ~1–2 cm off even on synthetic data.
 - Scaling: assembly is O(rooms²) placements, fine for a house, not for a neighbourhood.
+- **A single image cannot produce a room.** Measured: 29% area error, ceiling unobservable in
+  0/150 frames. Multi-view capture is a requirement, not an optimisation.
 
 ## Next
 
@@ -120,13 +159,16 @@ pin3d/
     openings.py      wall-gap door detection + detector protocol
     floorplan.py     per-room placements → global 2D assembly
     reconstruct.py   orchestrator
+    depth.py         ONNX monocular depth (Depth Anything V2 Small)
+    real.py          real-photo harness: NYU loader, depth metrics, geometry A/B
   eval/
     metrics.py       IoU, corner distance, ceiling MAE, door P/R, adjacency F1
     zind.py          ZInD annotation adapter
   cli.py
 viewer/floorplan.html
 examples/            generated demo plan + ground truth
-tests/               81 tests, stdlib unittest
+scripts/fetch_models.sh
+tests/               92 tests, stdlib unittest
 docs/BRAINSTORM.md   design record, decisions, open questions
 ```
 

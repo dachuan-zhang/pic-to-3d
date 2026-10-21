@@ -16,3 +16,6 @@ samples/
 
 # os
 .DS_Store
+
+# downloaded models
+models/
