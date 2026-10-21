@@ -314,6 +314,15 @@ def cmd_photos(args: argparse.Namespace) -> int:
             }
         except ValueError:
             plan.meta["images"] = {"depth": f"{path.stem}_depth.png"}
+        # the camera that took the photo: lets the viewer project the image back onto the
+        # reconstruction (projective texturing), which is the whole point of a 3D photo
+        plan.meta["camera"] = {
+            "x": 0.0, "y": 0.0, "z": 0.0,
+            "fx": float(K[0, 0]), "fy": float(K[1, 1]),
+            "cx": float(K[0, 2]), "cy": float(K[1, 2]),
+            "width": int(w), "height": int(h),
+            "hfov_deg": float(args.hfov),
+        }
         plan.meta["floor_residual_m"] = round(float(m["floor_residual"]), 3)
         plan.meta["scale_source"] = f"floor plane + {args.camera_height} m camera prior"
         dest = out / f"{path.stem}.json"

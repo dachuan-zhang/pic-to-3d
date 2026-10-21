@@ -70,7 +70,10 @@
       <button id="mode3d">3D walk</button>
     </div>
     <div class="row">
+      <button id="tex" class="on">texture photo</button>
       <button id="snap">snap 5cm</button>
+    </div>
+    <div class="row">
       <button id="export">export JSON</button>
     </div>
     <div class="row">
@@ -100,6 +103,10 @@ const SRC = params.get('src') || '../examples/floorplan.json';
 let plan = { units: 'meters', rooms: [], adjacency: [], meta: {} };
 let planUrl = null;          // base for resolving meta.images
 let sourceMode = 0;          // 0 = photo, 1 = depth
+let textureOn = true;
+let photoTexture = null;     // THREE.Texture of the source photo
+let texImg = null;            // HTMLImageElement for the Canvas2D renderer
+let photoStamp = null;       // which image the texture belongs to
 let snapStep = 0.05;
 let mode = '2d';
 let roomColors = {};
@@ -392,6 +399,11 @@ canvas.addEventListener('wheel', (e) => {
 // ---------------------------------------------------------------------------
 // export
 // ---------------------------------------------------------------------------
+document.getElementById('tex').onclick = (e) => {
+  textureOn = !textureOn;
+  e.target.classList.toggle('on', textureOn);
+  rebuild3D();
+};
 document.getElementById('snap').onclick = (e) => {
   snapStep = snapStep > 0 ? 0 : 0.05;
   e.target.classList.toggle('on', snapStep > 0);
@@ -537,11 +549,27 @@ function rebuildWebGL(b) {
   const floorMat = new THREE.MeshStandardMaterial({ color: 0x243449, roughness: 1, side: THREE.DoubleSide });
   const ceilMat = new THREE.MeshStandardMaterial({ color: 0x8894a8, roughness: 1, side: THREE.DoubleSide });
 
+  const tex = ensureTexture();
+  const cam = (plan.meta || {}).camera;
+
   for (const room of plan.rooms || []) {
     const H = room.ceiling || 2.7;
     const col = new THREE.Color(roomColors[room.id] || '#4fc3f7');
-    const shape = new THREE.Shape(room.polygon.map(([x, y]) => new THREE.Vector2(x, y)));
 
+    // wall geometry as triangles, so the same list feeds the textured and untextured paths
+    const wallTris = [];
+    for (const sl of wallSlabs(room)) {
+      const at = (t, y) => [sl.a[0] + sl.dir[0] * t, y, sl.a[1] + sl.dir[1] * t];
+      const p0 = at(sl.s0, sl.y0), p1 = at(sl.s1, sl.y0);
+      const p2 = at(sl.s1, sl.y1), p3 = at(sl.s0, sl.y1);
+      wallTris.push([p0, p1, p2], [p0, p2, p3]);
+    }
+    const floorTris = polygonTriangles(room, 0.002);
+    const ceilTris = polygonTriangles(room, H);
+
+    // Always draw the plain shell: it is what we know geometrically, and it shows through
+    // wherever the photo has no pixels. The photo is overlaid on top.
+    const shape = new THREE.Shape(room.polygon.map(([x, y]) => new THREE.Vector2(x, y)));
     const floor = new THREE.Mesh(new THREE.ShapeGeometry(shape), floorMat.clone());
     floor.material.color.copy(col).multiplyScalar(0.22);
     floor.rotation.x = Math.PI / 2;
@@ -562,6 +590,14 @@ function rebuildWebGL(b) {
       mesh.rotation.y = -Math.atan2(sl.dir[1], sl.dir[0]);
       root.add(mesh);
     }
+
+    if (tex && cam) {
+      for (const mesh of [texturedMesh(wallTris, cam, tex),
+                          texturedMesh(floorTris, cam, tex),
+                          texturedMesh(ceilTris, cam, tex)]) {
+        if (mesh) root.add(mesh);
+      }
+    }
   }
 }
 
@@ -578,33 +614,38 @@ function initSoftware() {
   return { kind: 'canvas', ctx: ctx2, polys: [] };
 }
 
+function loadSoftwareTexture() {
+  texImg = null;
+  const meta = plan.meta || {};
+  const imgs = meta.images || {};
+  if (!textureOn || !imgs.rgb || !meta.camera) return;
+  const url = resolveAsset(imgs.rgb);
+  if (!url) return;
+  const img = new Image();
+  img.onload = () => { if (backend && backend.kind === 'canvas') texImg = img; };
+  img.src = url;
+}
+
 function buildSoftwareScene() {
   const polys = [];
+  const cam = (plan.meta || {}).camera;
+  const uvOf = (p) => (cam && textureOn ? projectUV(p, cam) : null);
   for (const room of plan.rooms || []) {
     const H = room.ceiling || 2.7;
     const col = hexToRgb(roomColors[room.id] || '#4fc3f7');
-    polys.push({
-      layer: 0,
-      pts: room.polygon.map(([x, y]) => [x, 0.001, y]),
-      rgb: mix([36, 52, 73], col, 0.25),
-      n: [0, 1, 0],
-    });
-    polys.push({
-      layer: 0,
-      pts: room.polygon.map(([x, y]) => [x, H, y]),
-      rgb: [120, 132, 152],
-      n: [0, -1, 0],
-    });
+    const floorPts = room.polygon.map(([x, y]) => [x, 0.001, y]);
+    const ceilPts = room.polygon.map(([x, y]) => [x, H, y]);
+    polys.push({ layer: 0, pts: floorPts, uv: floorPts.map(uvOf),
+                 rgb: mix([36, 52, 73], col, 0.25), n: [0, 1, 0] });
+    polys.push({ layer: 0, pts: ceilPts, uv: ceilPts.map(uvOf),
+                 rgb: [120, 132, 152], n: [0, -1, 0] });
     for (const sl of wallSlabs(room)) {
       const p0 = [sl.a[0] + sl.dir[0] * sl.s0, sl.a[1] + sl.dir[1] * sl.s0];
       const p1 = [sl.a[0] + sl.dir[0] * sl.s1, sl.a[1] + sl.dir[1] * sl.s1];
-      polys.push({
-        layer: 1,
-        pts: [[p0[0], sl.y0, p0[1]], [p1[0], sl.y0, p1[1]],
-              [p1[0], sl.y1, p1[1]], [p0[0], sl.y1, p0[1]]],
-        rgb: mix([207, 216, 230], col, 0.12),
-        n: [-sl.dir[1], 0, sl.dir[0]],
-      });
+      const wallPts = [[p0[0], sl.y0, p0[1]], [p1[0], sl.y0, p1[1]],
+                       [p1[0], sl.y1, p1[1]], [p0[0], sl.y1, p0[1]]];
+      polys.push({ layer: 1, pts: wallPts, uv: wallPts.map(uvOf),
+                   rgb: mix([207, 216, 230], col, 0.12), n: [-sl.dir[1], 0, sl.dir[0]] });
     }
   }
   return polys;
@@ -655,7 +696,10 @@ function renderSoftware(b) {
       zsum += p[2];
       return [cx + (p[0] / p[2]) * focal, cy - (p[1] / p[2]) * focal];
     });
-    draw.push({ screen, z: zsum / clipped.length, layer: poly.layer, rgb: poly.rgb, n: poly.n });
+    // near-plane clipping changes the vertex count, so the UVs no longer correspond
+    const uv = (clipped.length === camPts.length) ? poly.uv : null;
+    draw.push({ screen, z: zsum / clipped.length, layer: poly.layer, rgb: poly.rgb,
+                n: poly.n, uv });
   }
 
   // painter's algorithm: floors/ceilings first, then walls far -> near
@@ -671,17 +715,153 @@ function renderSoftware(b) {
     c.closePath();
     c.fillStyle = rgba(rgb);
     c.fill();
+
+    if (texImg && poly.uv && poly.uv.every((q) => q)) {
+      // affine map per triangle, fan from vertex 0; the fan is shallow so the error is small
+      for (let i = 1; i + 1 < poly.screen.length; i++) {
+        const tri = [poly.screen[0], poly.screen[i], poly.screen[i + 1]];
+        const uvt = [poly.uv[0], poly.uv[i], poly.uv[i + 1]];
+        if (!uvt.every((q) => q[0] >= -0.02 && q[0] <= 1.02 && q[1] >= -0.02 && q[1] <= 1.02)) continue;
+        const m = affineUVtoScreen(
+          uvt.map((q) => [q[0] * texImg.width, q[1] * texImg.height]),
+          tri,
+        );
+        if (!m) continue;
+        c.save();
+        c.beginPath();
+        c.moveTo(tri[0][0], tri[0][1]);
+        c.lineTo(tri[1][0], tri[1][1]);
+        c.lineTo(tri[2][0], tri[2][1]);
+        c.closePath();
+        c.clip();
+        c.transform(m[0], m[1], m[2], m[3], m[4], m[5]);
+        c.drawImage(texImg, 0, 0);
+        c.restore();
+      }
+    }
+
     c.strokeStyle = rgba(rgb);
     c.lineWidth = 0.6;   // seals hairline seams between adjacent slabs
+    c.beginPath();
+    poly.screen.forEach((p, i) => (i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])));
+    c.closePath();
     c.stroke();
   }
 }
 
+// affine transform taking texture pixels -> screen, from three correspondences
+function affineUVtoScreen(uv, xy) {
+  const [u0, v0] = uv[0], [u1, v1] = uv[1], [u2, v2] = uv[2];
+  const det = u0 * (v1 - v2) - v0 * (u1 - u2) + (u1 * v2 - u2 * v1);
+  if (Math.abs(det) < 1e-9) return null;
+  const solve = (p0, p1, p2) => [
+    (p0 * (v1 - v2) - v0 * (p1 - p2) + (p1 * v2 - p2 * v1)) / det,
+    (u0 * (p1 - p2) - p0 * (u1 - u2) + (u1 * p2 - u2 * p1)) / det,
+    (u0 * (v1 * p2 - v2 * p1) - v0 * (u1 * p2 - u2 * p1) + p0 * (u1 * v2 - u2 * v1)) / det,
+  ];
+  const [a, cc, e] = solve(xy[0][0], xy[1][0], xy[2][0]);
+  const [b, d, f] = solve(xy[0][1], xy[1][1], xy[2][1]);
+  return [a, b, cc, d, e, f];
+}
+
 // --- shared frame ----------------------------------------------------------
+// Project a world point through the source camera. Camera looks along +Z in plan
+// coordinates with +Y up, so the image's y axis is flipped relative to world Y.
+function projectUV(p, c) {
+  const xc = p[0] - c.x, yc = -(p[1] - c.y), zc = Math.max(p[2] - c.z, 0.05);
+  const u = (c.fx * xc) / zc + c.cx;
+  const v = (c.fy * yc) / zc + c.cy;
+  return [u / c.width, 1 - v / c.height];
+}
+
+function ensureTexture() {
+  const meta = plan.meta || {};
+  const imgs = meta.images || {};
+  if (!textureOn || !imgs.rgb || !meta.camera || !backend || backend.kind !== 'webgl') return null;
+  const url = resolveAsset(imgs.rgb);
+  if (!url) return null;
+  const THREE = backend.THREE;
+  if (photoTexture && photoStamp === url) return photoTexture;
+  const loader = new THREE.TextureLoader();
+  photoStamp = url;
+  const tex = loader.load(url, (t) => {
+    t.colorSpace = THREE.SRGBColorSpace;
+    rebuild3D();                      // re-render now that pixels have arrived
+  });
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  photoTexture = tex;
+  return tex;
+}
+
+// Split a triangle until the linear UV interpolation across it is a fair approximation of
+// the true projective map.
+function subdivideTri(tri, depth) {
+  if (depth <= 0) return [tri];
+  const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2];
+  const [a, b, c] = tri;
+  const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+  return [].concat(
+    subdivideTri([a, ab, ca], depth - 1),
+    subdivideTri([ab, b, bc], depth - 1),
+    subdivideTri([ca, bc, c], depth - 1),
+    subdivideTri([ab, bc, ca], depth - 1),
+  );
+}
+
+function uvInFrame(p, cam) {
+  const zc = p[2] - cam.z;
+  if (zc <= 0.05) return false;
+  const t = projectUV(p, cam);
+  return t[0] >= -0.02 && t[0] <= 1.02 && t[1] >= -0.02 && t[1] <= 1.02;
+}
+
+function texturedMesh(triangles, cam, tex) {
+  const THREE = backend.THREE;
+  const pos = [], uv = [], idx = [];
+  for (const tri of triangles) {
+    for (const sub of subdivideTri(tri, 2)) {
+      // only paint where the photo actually has pixels; anything outside would smear
+      if (!sub.every((v) => uvInFrame(v, cam))) continue;
+      const base = pos.length / 3;
+      for (const p of sub) {
+        pos.push(p[0], p[1], p[2]);
+        const t = projectUV(p, cam);
+        uv.push(t[0], t[1]);
+      }
+      idx.push(base, base + 1, base + 2);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  if (!idx.length) { g.dispose(); return null; }
+  const mat = new THREE.MeshStandardMaterial({
+    map: tex, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+  });
+  return new THREE.Mesh(g, mat);
+}
+
+function polygonTriangles(room, y) {
+  // fan from the centroid, so long rooms do not get sliver triangles
+  const poly = room.polygon;
+  const c = centroid(poly);
+  const tris = [];
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    tris.push([[c[0], y, c[1]], [a[0], y, a[1]], [b[0], y, b[1]]]);
+  }
+  return tris;
+}
+
 function rebuild3D() {
   if (!backend) return;
   if (backend.kind === 'webgl') rebuildWebGL(backend);
-  else backend.polys = buildSoftwareScene();
+  else { backend.polys = buildSoftwareScene(); loadSoftwareTexture(); }
 }
 
 function insideAnyRoom(x, z, margin = 0.22) {
