@@ -66,6 +66,8 @@ python -m pin3d.cli validate --plan out/plan.json
   (snap toggle), export the edited JSON.
 - **3D walk**: walls extruded with real door gaps and lintels, pointer-lock first-person camera
   clipped to the room polygons, so you cannot walk through walls. `F` toggles an overview camera.
+  Uses WebGL when available and falls back to a Canvas2D software renderer otherwise, so the 3D
+  view cannot fail to start. three.js is vendored (`viewer/vendor/`), so nothing loads from a CDN.
 
 Editing matters: automatic floorplans are never right, and a room you can fix in ten seconds
 beats a 3D scene you cannot fix at all.
@@ -127,6 +129,13 @@ examples/            generated demo plan + ground truth
 tests/               81 tests, stdlib unittest
 docs/BRAINSTORM.md   design record, decisions, open questions
 ```
+
+## Viewer gotchas (already handled, worth knowing)
+
+- A canvas accepts **one** context type for its lifetime. The 2D editor and the WebGL view use
+  separate elements (`#view2d`, `#view3d`) — sharing one element makes `WebGLRenderer` fail with
+  "Error creating WebGL context", which looks like a broken GPU but is a spec behaviour.
+- `?renderer=canvas` forces the software renderer; `?renderer=webgl` forces WebGL.
 
 ## Note on macOS
 

@@ -358,6 +358,20 @@ recur on real data:
 Also: on macOS, numpy 2.0 + Accelerate BLAS emits spurious `divide by zero ... in matmul` for
 `(N,2) @ (2,)` on finite input — hence the BLAS-free helpers in `geometry.py`.
 
+Viewer lessons (both cost a debugging round-trip because the first error message blamed the
+environment):
+
+5. **A canvas holds exactly one context type.** The 2D editor called `getContext('2d')` on
+   page load, so handing that same element to `WebGLRenderer` could never work — it surfaced as
+   "Error creating WebGL context", which reads like a broken GPU. Fix: separate `#view2d` and
+   `#view3d` elements.
+6. **Do not let the demo depend on a CDN or on WebGL.** three.js is vendored under
+   `viewer/vendor/`, and there is a Canvas2D painter's-algorithm fallback (near-plane clipping,
+   flat shading, distance fog) so the 3D view renders even with WebGL unavailable. A fallback
+   plus a verified-by-headless-test renderer beats a better renderer that might not start.
+7. **Error overlays must print the real exception.** Both failures were misdiagnosed because
+   the catch block substituted a plausible story for `err.message`.
+
 ## 16. Open questions
 
 1. **Compute** — GPU available locally, or target a hosted endpoint (Replicate/fal) for

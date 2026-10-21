@@ -14,7 +14,9 @@
     font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
   #app { display: grid; grid-template-columns: 1fr 300px; height: 100%; }
   #stage { position: relative; min-width: 0; }
-  canvas { display: block; width: 100%; height: 100%; }
+  canvas { display: block; width: 100%; height: 100%; position: absolute; inset: 0; }
+  canvas[hidden] { display: none; }
+  #stage { position: relative; }
   #panel { background: var(--panel); border-left: 1px solid var(--line);
     padding: 14px; overflow-y: auto; }
   h1 { font-size: 14px; margin: 0 0 4px; letter-spacing: .04em; }
@@ -44,7 +46,8 @@
 <body>
 <div id="app">
   <div id="stage">
-    <canvas id="view"></canvas>
+    <canvas id="view2d"></canvas>
+    <canvas id="view3d" hidden></canvas>
     <div id="hud">loading…</div>
     <div id="err"></div>
   </div>
@@ -184,7 +187,7 @@ function renderSidebar() {
 // ---------------------------------------------------------------------------
 // 2D editor
 // ---------------------------------------------------------------------------
-const canvas = document.getElementById('view');
+const canvas = document.getElementById('view2d');
 const ctx = canvas.getContext('2d');
 let view = { scale: 60, ox: 40, oy: 40 };
 let selected = null, dragging = false, panning = false;
@@ -355,123 +358,275 @@ document.getElementById('file').onchange = async (e) => {
 };
 
 // ---------------------------------------------------------------------------
-// 3D
+// 3D — renderer-agnostic camera state + two backends
 // ---------------------------------------------------------------------------
-let three = null;               // { THREE, renderer, scene, camera, ... }
-let threeFailed = false;
+// A canvas can hold exactly ONE context type: requesting '2d' makes every later
+// getContext('webgl') return null. The 2D editor owns #view2d and the 3D view owns
+// #view3d, which is why the earlier build could never create a WebGL context.
+const cam = {
+  x: 0, y: 1.6, z: 0, yaw: 0, pitch: 0,
+  keys: new Set(), locked: false, overview: false,
+};
+let backend = null;          // { kind: 'webgl' | 'canvas', ... }
+let hudBase = 'ready';
+let backendTried = false;
 
-async function init3D() {
-  if (three || threeFailed) return three;
+const FOV = 72 * Math.PI / 180;
+const NEAR = 0.06;
+const BG = [16, 19, 26];
+const LIGHT = (() => {
+  const v = [0.36, 0.86, 0.36], n = Math.hypot(...v);
+  return [v[0] / n, v[1] / n, v[2] / n];
+})();
+
+const view3d = document.getElementById('view3d');
+
+function hexToRgb(hex) {
+  const h = hex.replace('#', '');
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+function webglAvailable() {
   try {
-    const THREE = await import('./vendor/three.module.js');
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x10131a);
-    scene.fog = new THREE.Fog(0x10131a, 18, 42);
-    const camera = new THREE.PerspectiveCamera(72, 1, 0.05, 200);
-    scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x2b2f3a, 1.05));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.1);
-    sun.position.set(6, 12, 4);
-    scene.add(sun);
-    const root = new THREE.Group();
-    scene.add(root);
-
-    three = { THREE, renderer, scene, camera, root, pos: new THREE.Vector3(0, 1.6, 0),
-              yaw: 0, pitch: 0, keys: new Set(), locked: false, overview: false };
-    return three;
-  } catch (err) {
-    threeFailed = true;
-    console.error('three.js load failed:', err);
-    showError(
-      '3D view unavailable — three.js could not be loaded from ./vendor/three.module.js\n\n' +
-      String(err && err.message ? err.message : err) + '\n\n' +
-      'Fix: make sure viewer/vendor/three.module.js exists (it ships with the repo), and that ' +
-      'the page is served with Content-Type text/javascript. The 2D editor still works.'
-    );
-    return null;
-  }
+    const probe = document.createElement('canvas');
+    return !!(probe.getContext('webgl2') || probe.getContext('webgl'));
+  } catch { return false; }
 }
 
-function clearRoot(g) {
-  while (g.children.length) {
-    const c = g.children.pop();
+/** Wall slabs for one room, shared by both backends: [s0, s1, y0, y1] along each wall. */
+function wallSlabs(room) {
+  const out = [];
+  const poly = room.polygon;
+  const H = room.ceiling || 2.7;
+  const ops = openSpans(room);
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L < 1e-6) continue;
+    const dir = [(b[0] - a[0]) / L, (b[1] - a[1]) / L];
+    const wallOps = ops.filter((o) => o.wall === i).sort((p, q) => p.span[0] - q.span[0]);
+    let cursor = 0;
+    const slabs = [];
+    for (const o of wallOps) {
+      const [s0, s1] = o.span;
+      if (s0 > cursor + 1e-4) slabs.push([cursor, s0, 0, H]);
+      slabs.push([s0, s1, o.head || 2.05, H]);          // lintel over the opening
+      if (o.type === 'window') slabs.push([s0, s1, 0, o.sill || 0.9]);
+      cursor = Math.max(cursor, s1);
+    }
+    if (cursor < L - 1e-4) slabs.push([cursor, L, 0, H]);
+    for (const [s0, s1, y0, y1] of slabs) {
+      if (s1 - s0 <= 1e-4 || y1 - y0 <= 1e-4) continue;
+      out.push({ a, dir, s0, s1, y0, y1, wall: i });
+    }
+  }
+  return out;
+}
+
+// --- camera basis ----------------------------------------------------------
+function camBasis() {
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const f = [Math.sin(cam.yaw) * cp, sp, Math.cos(cam.yaw) * cp];
+  const inv = 1 / Math.max(cp, 1e-6);
+  const r = [-f[2] * inv, 0, f[0] * inv];
+  const u = [-f[0] * f[1] * inv, cp, -f[2] * f[1] * inv];
+  return { f, r, u };
+}
+
+async function initBackend() {
+  if (backend || backendTried) return backend;
+  backendTried = true;
+  const want = params.get('renderer');
+  if (want !== 'canvas' && webglAvailable()) {
+    try {
+      backend = await initWebGL();
+      document.getElementById('hud').dataset.renderer = 'webgl';
+      return backend;
+    } catch (err) {
+      console.warn('WebGL backend failed, using software renderer:', err);
+    }
+  }
+  backend = initSoftware();
+  document.getElementById('hud').dataset.renderer = 'canvas';
+  return backend;
+}
+
+// --- backend A: WebGL (three.js, vendored) ---------------------------------
+async function initWebGL() {
+  const THREE = await import('./vendor/three.module.js');
+  const renderer = new THREE.WebGLRenderer({ canvas: view3d, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x10131a);
+  scene.fog = new THREE.Fog(0x10131a, 18, 42);
+  const camera = new THREE.PerspectiveCamera(72, 1, NEAR, 200);
+  scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x2b2f3a, 1.05));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+  sun.position.set(6, 12, 4);
+  scene.add(sun);
+  const root = new THREE.Group();
+  scene.add(root);
+  return { kind: 'webgl', THREE, renderer, scene, camera, root };
+}
+
+function rebuildWebGL(b) {
+  const { THREE, root } = b;
+  while (root.children.length) {
+    const c = root.children.pop();
     c.geometry?.dispose?.();
     c.material?.dispose?.();
   }
-}
-
-function rebuild3D() {
-  if (!three) return;
-  const { THREE, root } = three;
-  clearRoot(root);
-
   const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfd8e6, roughness: 0.92, metalness: 0 });
-  const floorMat = new THREE.MeshStandardMaterial({ color: 0x243449, roughness: 1 });
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x243449, roughness: 1, side: THREE.DoubleSide });
+  const ceilMat = new THREE.MeshStandardMaterial({ color: 0x8894a8, roughness: 1, side: THREE.DoubleSide });
 
   for (const room of plan.rooms || []) {
     const H = room.ceiling || 2.7;
-    const poly = room.polygon;
     const col = new THREE.Color(roomColors[room.id] || '#4fc3f7');
+    const shape = new THREE.Shape(room.polygon.map(([x, y]) => new THREE.Vector2(x, y)));
 
-    // floor
-    const shape = new THREE.Shape(poly.map(([x, y]) => new THREE.Vector2(x, y)));
     const floor = new THREE.Mesh(new THREE.ShapeGeometry(shape), floorMat.clone());
     floor.material.color.copy(col).multiplyScalar(0.22);
     floor.rotation.x = Math.PI / 2;
     floor.position.y = 0.002;
-    floor.material.side = THREE.DoubleSide;
     root.add(floor);
 
-    // ceiling
-    const ceil = new THREE.Mesh(new THREE.ShapeGeometry(shape), wallMat.clone());
-    ceil.material.color = new THREE.Color(0x8894a8);
+    const ceil = new THREE.Mesh(new THREE.ShapeGeometry(shape), ceilMat.clone());
     ceil.rotation.x = Math.PI / 2;
     ceil.position.y = H;
-    ceil.material.side = THREE.DoubleSide;
     root.add(ceil);
 
-    // walls with openings
-    const ops = openSpans(room);
-    for (let i = 0; i < poly.length; i++) {
-      const a = poly[i], b = poly[(i + 1) % poly.length];
-      const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
-      if (L < 1e-6) continue;
-      const dir = [(b[0] - a[0]) / L, (b[1] - a[1]) / L];
-      const wallOps = ops.filter((o) => o.wall === i).sort((p, q) => p.span[0] - q.span[0]);
-      let cursor = 0;
-      const slabs = [];
-      for (const o of wallOps) {
-        const [s0, s1] = o.span;
-        if (s0 > cursor + 1e-4) slabs.push([cursor, s0, 0, H]);
-        slabs.push([s0, s1, o.head || 2.05, H]);           // lintel
-        if (o.type === 'window') slabs.push([s0, s1, 0, o.sill || 0.9]);
-        cursor = Math.max(cursor, s1);
-      }
-      if (cursor < L - 1e-4) slabs.push([cursor, L, 0, H]);
-
-      for (const [s0, s1, y0, y1] of slabs) {
-        const len = s1 - s0, hgt = y1 - y0;
-        if (len <= 1e-4 || hgt <= 1e-4) continue;
-        const geo = new THREE.BoxGeometry(len, hgt, 0.06);
-        const mesh = new THREE.Mesh(geo, wallMat);
-        const mid = [(a[0] + dir[0] * (s0 + s1) / 2), (a[1] + dir[1] * (s0 + s1) / 2)];
-        mesh.position.set(mid[0], y0 + hgt / 2, mid[1]);
-        mesh.rotation.y = -Math.atan2(dir[1], dir[0]);
-        root.add(mesh);
-      }
+    for (const sl of wallSlabs(room)) {
+      const len = sl.s1 - sl.s0, hgt = sl.y1 - sl.y0;
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(len, hgt, 0.06), wallMat);
+      const mid = [sl.a[0] + sl.dir[0] * (sl.s0 + sl.s1) / 2,
+                   sl.a[1] + sl.dir[1] * (sl.s0 + sl.s1) / 2];
+      mesh.position.set(mid[0], sl.y0 + hgt / 2, mid[1]);
+      mesh.rotation.y = -Math.atan2(sl.dir[1], sl.dir[0]);
+      root.add(mesh);
     }
   }
+}
 
-  // spawn inside the first room
-  const first = (plan.rooms || [])[0];
-  if (first) {
-    const [cx, cy] = centroid(first.polygon);
-    three.pos.set(cx, 1.6, cy);
+function renderWebGL(b) {
+  const { f } = camBasis();
+  b.camera.position.set(cam.x, cam.y, cam.z);
+  b.camera.lookAt(cam.x + f[0], cam.y + f[1], cam.z + f[2]);
+  b.renderer.render(b.scene, b.camera);
+}
+
+// --- backend B: software renderer (Canvas2D, no WebGL at all) --------------
+function initSoftware() {
+  const ctx2 = view3d.getContext('2d');
+  return { kind: 'canvas', ctx: ctx2, polys: [] };
+}
+
+function buildSoftwareScene() {
+  const polys = [];
+  for (const room of plan.rooms || []) {
+    const H = room.ceiling || 2.7;
+    const col = hexToRgb(roomColors[room.id] || '#4fc3f7');
+    polys.push({
+      layer: 0,
+      pts: room.polygon.map(([x, y]) => [x, 0.001, y]),
+      rgb: mix([36, 52, 73], col, 0.25),
+      n: [0, 1, 0],
+    });
+    polys.push({
+      layer: 0,
+      pts: room.polygon.map(([x, y]) => [x, H, y]),
+      rgb: [120, 132, 152],
+      n: [0, -1, 0],
+    });
+    for (const sl of wallSlabs(room)) {
+      const p0 = [sl.a[0] + sl.dir[0] * sl.s0, sl.a[1] + sl.dir[1] * sl.s0];
+      const p1 = [sl.a[0] + sl.dir[0] * sl.s1, sl.a[1] + sl.dir[1] * sl.s1];
+      polys.push({
+        layer: 1,
+        pts: [[p0[0], sl.y0, p0[1]], [p1[0], sl.y0, p1[1]],
+              [p1[0], sl.y1, p1[1]], [p0[0], sl.y1, p0[1]]],
+        rgb: mix([207, 216, 230], col, 0.12),
+        n: [-sl.dir[1], 0, sl.dir[0]],
+      });
+    }
   }
-  document.getElementById('hud').textContent =
-    `${plan.rooms.length} rooms · ${plan.rooms.reduce((s, r) => s + area(r.polygon), 0).toFixed(1)} m² · ` +
-    `${plan.rooms.reduce((s, r) => s + (r.openings || []).length, 0)} openings`;
+  return polys;
+}
+
+function clipNear(ptsCamera) {
+  const out = [];
+  for (let i = 0; i < ptsCamera.length; i++) {
+    const cur = ptsCamera[i], prev = ptsCamera[(i + ptsCamera.length - 1) % ptsCamera.length];
+    const curIn = cur[2] >= NEAR, prevIn = prev[2] >= NEAR;
+    if (curIn !== prevIn) {
+      const t = (NEAR - prev[2]) / (cur[2] - prev[2]);
+      out.push([prev[0] + (cur[0] - prev[0]) * t, prev[1] + (cur[1] - prev[1]) * t, NEAR]);
+    }
+    if (curIn) out.push(cur);
+  }
+  return out;
+}
+
+function renderSoftware(b) {
+  const { ctx: c } = b;
+  const W = view3d.width, H = view3d.height;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const cssW = W / dpr, cssH = H / dpr;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.fillStyle = rgba(BG);
+  c.fillRect(0, 0, cssW, cssH);
+
+  const { f, r, u } = camBasis();
+  const focal = (cssH / 2) / Math.tan(FOV / 2);
+  const cx = cssW / 2, cy = cssH / 2;
+
+  const draw = [];
+  for (const poly of b.polys) {
+    const camPts = poly.pts.map((p) => {
+      const dx = p[0] - cam.x, dy = p[1] - cam.y, dz = p[2] - cam.z;
+      return [
+        dx * r[0] + dy * r[1] + dz * r[2],
+        dx * u[0] + dy * u[1] + dz * u[2],
+        dx * f[0] + dy * f[1] + dz * f[2],
+      ];
+    });
+    if (camPts.every((p) => p[2] < NEAR)) continue;
+    const clipped = camPts.some((p) => p[2] < NEAR) ? clipNear(camPts) : camPts;
+    if (clipped.length < 3) continue;
+    let zsum = 0;
+    const screen = clipped.map((p) => {
+      zsum += p[2];
+      return [cx + (p[0] / p[2]) * focal, cy - (p[1] / p[2]) * focal];
+    });
+    draw.push({ screen, z: zsum / clipped.length, layer: poly.layer, rgb: poly.rgb, n: poly.n });
+  }
+
+  // painter's algorithm: floors/ceilings first, then walls far -> near
+  draw.sort((p, q) => (p.layer - q.layer) || (q.z - p.z));
+
+  for (const poly of draw) {
+    const lambert = Math.abs(poly.n[0] * LIGHT[0] + poly.n[1] * LIGHT[1] + poly.n[2] * LIGHT[2]);
+    let rgb = poly.rgb.map((v) => v * (0.38 + 0.62 * lambert));
+    const fog = Math.min(0.72, Math.max(0, (poly.z - 7) / 30));
+    rgb = mix(rgb, BG, fog);
+    c.beginPath();
+    poly.screen.forEach((p, i) => (i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])));
+    c.closePath();
+    c.fillStyle = rgba(rgb);
+    c.fill();
+    c.strokeStyle = rgba(rgb);
+    c.lineWidth = 0.6;   // seals hairline seams between adjacent slabs
+    c.stroke();
+  }
+}
+
+// --- shared frame ----------------------------------------------------------
+function rebuild3D() {
+  if (!backend) return;
+  if (backend.kind === 'webgl') rebuildWebGL(backend);
+  else backend.polys = buildSoftwareScene();
 }
 
 function insideAnyRoom(x, z, margin = 0.22) {
@@ -487,58 +642,62 @@ function insideAnyRoom(x, z, margin = 0.22) {
   return false;
 }
 
-function step3D(dt) {
-  if (!three) return;
-  const { camera, pos, keys } = three;
-  const speed = (keys.has('shift') ? 3.4 : 1.5) * dt;
-
-  if (!three.overview) {
-    let fx = 0, fz = 0;
-    if (keys.has('w')) { fx += Math.sin(three.yaw); fz += Math.cos(three.yaw); }
-    if (keys.has('s')) { fx -= Math.sin(three.yaw); fz -= Math.cos(three.yaw); }
-    if (keys.has('a')) { fx += Math.cos(three.yaw); fz -= Math.sin(three.yaw); }
-    if (keys.has('d')) { fx -= Math.cos(three.yaw); fz += Math.sin(three.yaw); }
-    const n = Math.hypot(fx, fz);
-    if (n > 0) {
-      const nx = pos.x + (fx / n) * speed;
-      const nz = pos.z + (fz / n) * speed;
-      // slide along walls instead of sticking
-      if (insideAnyRoom(nx, nz)) { pos.x = nx; pos.z = nz; }
-      else if (insideAnyRoom(nx, pos.z)) { pos.x = nx; }
-      else if (insideAnyRoom(pos.x, nz)) { pos.z = nz; }
-    }
-    camera.position.set(pos.x, pos.y, pos.z);
-    camera.rotation.set(three.pitch, three.yaw + Math.PI, 0, 'YXZ');
-  } else {
-    const b = plan.rooms.length ? plan.rooms[0].polygon : [[0, 0]];
-    const [cx, cy] = centroid(b);
-    camera.position.set(cx + 7, 11, cy + 9);
-    camera.lookAt(cx, 0, cy);
-  }
+function lookAtFrom(px, py, pz, tx, ty, tz) {
+  const dx = tx - px, dy = ty - py, dz = tz - pz;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  cam.yaw = Math.atan2(dx, dz);
+  cam.pitch = Math.asin(Math.max(-1, Math.min(1, dy / len)));
 }
 
-// pointer lock look
-canvas.addEventListener('click', async () => {
-  if (mode !== '3d' || !three) return;
-  await init3D();
-  canvas.requestPointerLock?.();
+function step3D(dt) {
+  if (cam.overview) {
+    const first = (plan.rooms || [])[0];
+    const [ccx, ccy] = first ? centroid(first.polygon) : [0, 0];
+    const px = ccx + 6.5, py = 10, pz = ccy + 8;
+    cam.x = px; cam.y = py; cam.z = pz;
+    lookAtFrom(px, py, pz, ccx, 0, ccy);
+    return;
+  }
+  const speed = (cam.keys.has('shift') ? 3.4 : 1.5) * dt;
+  let fx = 0, fz = 0;
+  if (cam.keys.has('w')) { fx += Math.sin(cam.yaw); fz += Math.cos(cam.yaw); }
+  if (cam.keys.has('s')) { fx -= Math.sin(cam.yaw); fz -= Math.cos(cam.yaw); }
+  if (cam.keys.has('a')) { fx += Math.cos(cam.yaw); fz -= Math.sin(cam.yaw); }
+  if (cam.keys.has('d')) { fx -= Math.cos(cam.yaw); fz += Math.sin(cam.yaw); }
+  const n = Math.hypot(fx, fz);
+  if (n > 0) {
+    const nx = cam.x + (fx / n) * speed;
+    const nz = cam.z + (fz / n) * speed;
+    // slide along walls instead of sticking
+    if (insideAnyRoom(nx, nz)) { cam.x = nx; cam.z = nz; }
+    else if (insideAnyRoom(nx, cam.z)) { cam.x = nx; }
+    else if (insideAnyRoom(cam.x, nz)) { cam.z = nz; }
+  }
+  cam.y = 1.6;
+}
+// ---------------------------------------------------------------------------
+// input (shared by both renderers)
+// ---------------------------------------------------------------------------
+view3d.addEventListener('click', async () => {
+  if (mode !== '3d') return;
+  await initBackend();
+  view3d.requestPointerLock?.();
 });
 document.addEventListener('pointerlockchange', () => {
-  if (three) three.locked = document.pointerLockElement === canvas;
+  cam.locked = document.pointerLockElement === view3d;
 });
 document.addEventListener('mousemove', (e) => {
-  if (!three || mode !== '3d' || !three.locked) return;
-  three.yaw -= e.movementX * 0.0026;
-  three.pitch = Math.max(-1.2, Math.min(1.2, three.pitch - e.movementY * 0.0026));
+  if (mode !== '3d' || !cam.locked) return;
+  cam.yaw -= e.movementX * 0.0026;
+  cam.pitch = Math.max(-1.2, Math.min(1.2, cam.pitch - e.movementY * 0.0026));
 });
 addEventListener('keydown', (e) => {
-  if (!three) return;
   const k = e.key.toLowerCase();
-  three.keys.add(k);
-  if (k === 'f') three.overview = !three.overview;
-  if (['w', 'a', 's', 'd'].includes(k) && mode === '3d') e.preventDefault();
+  cam.keys.add(k);
+  if (k === 'f') { cam.overview = !cam.overview; cam.locked = false; }
+  if (mode === '3d' && ['w', 'a', 's', 'd'].includes(k)) e.preventDefault();
 });
-addEventListener('keyup', (e) => three?.keys.delete(e.key.toLowerCase()));
+addEventListener('keyup', (e) => cam.keys.delete(e.key.toLowerCase()));
 
 // ---------------------------------------------------------------------------
 // mode switching + loop
@@ -549,20 +708,59 @@ function setMode(next) {
   document.getElementById('mode3d').classList.toggle('on', next === '3d');
   document.getElementById('hint2d').hidden = next !== '2d';
   document.getElementById('hint3d').hidden = next !== '3d';
+  canvas.hidden = next !== '2d';
+  view3d.hidden = next !== '3d';
+  if (next !== '3d' && document.pointerLockElement) document.exitPointerLock();
+
   resize();
-  if (next === '3d') init3D().then(rebuild3D);
+  document.getElementById('err').style.display = 'none';
+  if (next === '3d') {
+    initBackend().then((b) => {
+      if (!b) return;
+      // start inside the first room, looking down its long axis
+      const first = (plan.rooms || [])[0];
+      if (first) {
+        const [cx0, cy0] = centroid(first.polygon);
+        cam.x = cx0; cam.z = cy0; cam.y = 1.6;
+        cam.yaw = 0; cam.pitch = 0;
+      }
+      rebuild3D();
+      const kind = b.kind === 'webgl' ? 'WebGL' : 'software renderer (no WebGL)';
+      document.getElementById('hud').textContent = `${hudBase} · ${kind}`;
+    });
+  } else {
+    draw2D();
+  }
 }
 document.getElementById('mode2d').onclick = () => setMode('2d');
 document.getElementById('mode3d').onclick = () => setMode('3d');
 
+function stageSize() {
+  const stage = document.getElementById('stage');
+  const r = stage.getBoundingClientRect();
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  return {
+    dpr,
+    w: Math.max(1, Math.floor(r.width)),
+    h: Math.max(1, Math.floor(r.height)),
+    pw: Math.max(1, Math.floor(r.width * dpr)),
+    ph: Math.max(1, Math.floor(r.height * dpr)),
+  };
+}
+
 function resize() {
-  const r = canvas.getBoundingClientRect();
-  canvas.width = Math.max(1, Math.floor(r.width * devicePixelRatio));
-  canvas.height = Math.max(1, Math.floor(r.height * devicePixelRatio));
-  if (three) {
-    three.renderer.setSize(canvas.width, canvas.height, false);
-    three.camera.aspect = canvas.width / Math.max(1, canvas.height);
-    three.camera.updateProjectionMatrix();
+  const { dpr, w, h, pw, ph } = stageSize();
+  for (const c of [canvas, view3d]) {
+    c.width = pw;
+    c.height = ph;
+  }
+  canvas.style.width = view3d.style.width = `${w}px`;
+  canvas.style.height = view3d.style.height = `${h}px`;
+
+  if (backend?.kind === 'webgl') {
+    backend.renderer.setSize(pw, ph, false);
+    backend.camera.aspect = w / Math.max(1, h);
+    backend.camera.updateProjectionMatrix();
   }
   if (mode === '2d') { fitView(); draw2D(); }
 }
@@ -572,11 +770,10 @@ let last = performance.now();
 function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
-  if (mode === '2d') {
-    // 2D only needs redraws on interaction
-  } else if (three) {
+  if (mode === '3d' && backend) {
     step3D(dt);
-    three.renderer.render(three.scene, three.camera);
+    if (backend.kind === 'webgl') renderWebGL(backend);
+    else renderSoftware(backend);
   }
   requestAnimationFrame(loop);
 }
