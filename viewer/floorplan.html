@@ -76,10 +76,6 @@
   </div>
 </div>
 
-<script type="importmap">
-{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
-</script>
-
 <script type="module">
 // ---------------------------------------------------------------------------
 // state
@@ -367,7 +363,7 @@ let threeFailed = false;
 async function init3D() {
   if (three || threeFailed) return three;
   try {
-    const THREE = await import('three');
+    const THREE = await import('./vendor/three.module.js');
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     const scene = new THREE.Scene();
@@ -386,7 +382,13 @@ async function init3D() {
     return three;
   } catch (err) {
     threeFailed = true;
-    showError('3D view unavailable (three.js failed to load from CDN). The 2D editor still works.');
+    console.error('three.js load failed:', err);
+    showError(
+      '3D view unavailable — three.js could not be loaded from ./vendor/three.module.js\n\n' +
+      String(err && err.message ? err.message : err) + '\n\n' +
+      'Fix: make sure viewer/vendor/three.module.js exists (it ships with the repo), and that ' +
+      'the page is served with Content-Type text/javascript. The 2D editor still works.'
+    );
     return null;
   }
 }
