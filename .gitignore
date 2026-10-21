@@ -12,7 +12,8 @@ out/
 *.npz
 
 # user photos (never commit; provenance unknown)
-samples/
+samples/*
+!samples/SOURCES.md
 
 # os
 .DS_Store

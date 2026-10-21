@@ -151,6 +151,7 @@ def fit_room_box(
     min_points: int = 40,
     cell: float = 0.25,
     cell_min_count: int = 3,
+    floor_y: Optional[float] = None,
 ) -> Optional[RoomBox]:
     """Fit a Manhattan rectangle to the wall support seen in a point cloud.
 
@@ -164,8 +165,15 @@ def fit_room_box(
     if len(pts) < min_points:
         return None
 
-    floor_y, ceiling_y = estimate_floor_ceiling(pts)
-    offset = floor_y if apply_floor else 0.0
+    if floor_y is not None:
+        # A known floor (e.g. metric scale recovered from a camera-height prior) is far more
+        # reliable than estimating it, and it pins the torso band where it belongs.
+        est_floor, ceiling_y = estimate_floor_ceiling(pts)
+        offset = float(floor_y)
+        ceiling_y = (ceiling_y - est_floor + offset) if ceiling_y is not None else None
+    else:
+        est_floor, ceiling_y = estimate_floor_ceiling(pts)
+        offset = est_floor if apply_floor else 0.0
     shifted = pts.copy()
     shifted[:, UP_AXIS] -= offset
 

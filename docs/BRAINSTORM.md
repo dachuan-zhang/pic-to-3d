@@ -420,6 +420,32 @@ Four findings, in order of how much they change the plan:
 **capture geometry is.** Level 2 (room box) is sound, but it requires multiple views per room —
 a single frame cannot close a room, see its ceiling, or separate it from the room next door.
 
+### 15c. Sample photos, no ground truth (7 CC-licensed interiors)
+
+Metric scale has no GT here, so it is recovered from a **floor plane plus a 1.5 m camera-height
+prior**: for floor pixels ``r_i * (a * pred_i + b) = h`` is homogeneous and linear in
+``(a, b, h)``, so an SVD gives the affine depth correction and the scale at once. Validated on
+NYU against GT: **AbsRel 0.302**, versus 0.171 when aligned to GT directly. The prior costs ~13
+points but is the difference between "relative" and "metres".
+
+It fails in a specific, instructive way. `sample10` — an empty apartment shot from a doorway,
+true size roughly 8 x 5 m — came out **5.7 x 1.4 m with 0.88 wall support**. A foreground plant
+filled the bottom band, the floor fit locked onto the plant, and every downstream number
+inherited the error. The only signal that flagged it was **floor inlier ratio 31%**, against
+75–88% for the photos that came out plausible. Confidence from the *geometry* (0.88) was
+actively misleading; confidence from the *scale fit* was correct.
+
+Also **0 doors detected across all 7 photos**. The gap detector needs a closed room boundary
+that a single view never provides.
+
+Two things this settles:
+
+1. **A confidence number only helps if it is attached to the thing that actually failed.**
+   Wall support was high precisely on the worst result.
+2. **Do not tune geometry against a handful of images.** A near-field exclusion search was
+   tried to rescue the occluded cases; it improved some photos, made others worse, and was
+   reverted. Seven images are not an evaluation set — that is what §15b's 150 rooms are for.
+
 ## 16. Open questions
 
 1. **Compute** — partially answered: depth needs no GPU (ONNX on CoreML/CPU, 0.6 s/room). Still

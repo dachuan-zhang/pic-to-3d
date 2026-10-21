@@ -214,8 +214,12 @@ def align_to_metric(
 CEILING_SUPPORT_MIN = 0.05
 
 
-def geometry_summary(cloud: np.ndarray, detector: Optional[Any] = None) -> Optional[Dict[str, Any]]:
-    box = fit_room_box(cloud)
+def geometry_summary(
+    cloud: np.ndarray,
+    detector: Optional[Any] = None,
+    floor_y: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    box = fit_room_box(cloud, floor_y=floor_y)
     if box is None:
         return None
     w, d = box.size
@@ -449,3 +453,147 @@ def floorplan_from_geometry(
                      else "one camera cannot close a room; the box is a partial extent."),
         },
     )
+
+
+# --------------------------------------------------------------------------
+# metric scale without ground truth: floor-plane prior
+# --------------------------------------------------------------------------
+def _fit_floor_plane(
+    p: np.ndarray, r: np.ndarray, rng: np.random.Generator, rounds: int
+) -> Optional[Tuple[float, np.ndarray]]:
+    """RANSAC over the homogeneous floor system; returns (median_residual, [a, b, h])."""
+    best: Optional[Tuple[float, np.ndarray]] = None
+    for _ in range(max(1, rounds)):
+        keep = rng.random(len(p)) < 0.7
+        if keep.sum() < 150:
+            continue
+        A = np.stack([r[keep] * p[keep], r[keep], -np.ones(int(keep.sum()))], axis=1)
+        try:
+            _, _, vt = np.linalg.svd(A, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        sol = vt[-1]
+        if abs(sol[2]) < 1e-12:
+            continue
+        a, b, hh = sol / sol[2]
+        if a * 0.5 + b <= 0:
+            a, b, hh = -a, -b, -hh
+        res = float(np.median(np.abs(r * (a * p + b) - hh)))
+        if best is None or res < best[0]:
+            best = (res, np.array([a, b, hh]))
+    return best
+
+
+def metric_from_floor_prior(
+    pred: np.ndarray,
+    K: np.ndarray = NYU_K,
+    camera_height: float = 1.5,
+    top: float = 0.70,
+    bottom: float = 0.98,
+    rounds: int = 12,
+    seed: int = 0,
+    near_exclusions: Sequence[float] = (0.0,),
+) -> Dict[str, Any]:
+    """Recover metric depth from an affine-invariant prediction using the floor plane.
+
+    Depth Anything V2 output is affine-invariant: ``z = a * pred + b`` with **both** unknown.
+    A scale factor alone cannot produce metres (measured: b is the same order as the scene
+    depth, so a pure-scale guess is off by ~2x). A floor plane supplies the missing constraint.
+
+    For a pixel on the floor, camera-space height is ``y = r * z`` with ``r = (v - cy) / fy``,
+    and the world floor sits ``h`` below the camera, so::
+
+        r_i * (a * pred_i + b) = h        for every floor pixel i
+
+    which is homogeneous and linear in ``(a, b, h)``. The null vector from an SVD gives the
+    solution up to a global scale; fixing ``h = camera_height`` makes it metric.
+
+    Two failure modes are handled explicitly, both observed on real photos:
+
+    * the bottom band may contain a **foreground object** (a plant, a sofa) rather than floor,
+      so the fit is retried with the nearest 15/30/45% of depth removed;
+    * the fit can be confidently wrong, so ``floor_inlier_ratio`` is returned and callers
+      should refuse to trust a scene below ~0.5.
+
+    No ground truth is used — only the prior that the camera was carried at a known height.
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    h, w = pred.shape
+    fy, cy = float(K[1, 1]), float(K[1, 2])
+    r_all = (np.arange(h, dtype=np.float64) - cy) / fy
+
+    band = np.zeros((h, w), dtype=bool)
+    band[int(h * top):int(h * bottom), :] = True
+    band &= np.isfinite(pred) & (pred > 0)
+    idx = np.flatnonzero(band.ravel())
+    if len(idx) < 200:
+        return {"ok": False, "reason": "floor band too small", "depth": pred}
+
+    p0 = pred.ravel()[idx]
+    r0 = r_all[np.repeat(np.arange(h), w)[idx]]
+
+    rng = np.random.default_rng(seed)
+    best: Optional[Tuple[float, np.ndarray, float]] = None
+    for excl in near_exclusions:
+        if excl > 0:
+            cut = float(np.quantile(p0, excl))
+            sub = p0 > cut
+            if sub.sum() < 300:
+                continue
+            p, r = p0[sub], r0[sub]
+        else:
+            p, r = p0, r0
+        fit = _fit_floor_plane(p, r, rng, rounds)
+        if fit is None:
+            continue
+        res, sol = fit
+        if best is None or res < best[0]:
+            best = (res, sol, excl)
+    if best is None:
+        return {"ok": False, "reason": "floor fit failed", "depth": pred}
+
+    res, sol, used_excl = best
+    # refit on inliers: the bottom band is not guaranteed to be all floor
+    p, r = p0, r0
+    if used_excl > 0:
+        sub = p0 > float(np.quantile(p0, used_excl))
+        p, r = p0[sub], r0[sub]
+    a, b, hh = sol
+    inlier_ratio = 0.0
+    for _ in range(3):
+        inl = np.abs(r * (a * p + b) - hh) < max(0.12 * abs(hh), 0.05)
+        if inl.sum() < 150:
+            break
+        A = np.stack([r[inl] * p[inl], r[inl], -np.ones(int(inl.sum()))], axis=1)
+        try:
+            _, _, vt = np.linalg.svd(A, full_matrices=False)
+        except np.linalg.LinAlgError:
+            break
+        cand = vt[-1]
+        if abs(cand[2]) < 1e-12:
+            break
+        a2, b2, h2 = cand / cand[2]
+        if a2 * 0.5 + b2 <= 0:
+            a2, b2, h2 = -a2, -b2, -h2
+        a, b, hh = a2, b2, h2
+        inlier_ratio = float(inl.mean())
+
+    scale = camera_height / hh        # the one thing the prior contributes
+    a, b = a * scale, b * scale
+    depth = np.clip(a * pred + b, 0.3, 20.0).astype(np.float32)
+    return {
+        "ok": True,
+        "a": float(a),
+        "b": float(b),
+        "camera_height": float(camera_height),
+        "floor_residual": res,
+        "floor_inlier_ratio": inlier_ratio,
+        "near_excluded": used_excl,
+        "relative_residual": res / max(abs(camera_height), 1e-6),
+        "depth": depth,
+    }
+
+def intrinsics_from_fov(width: int, height: int, hfov_deg: float = 68.0) -> np.ndarray:
+    """Pinhole intrinsics from an assumed horizontal FOV (no EXIF needed)."""
+    fx = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+    return np.array([[fx, 0.0, width / 2.0], [0.0, fx, height / 2.0], [0.0, 0.0, 1.0]])

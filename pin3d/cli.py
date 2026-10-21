@@ -24,12 +24,15 @@ from .pipeline.poses import StubBackend, StubScene, get_backend, load_or_estimat
 from .pipeline.depth import OnnxDepth
 from .pipeline.real import (
     Sample,
+    intrinsics_from_fov,
+    metric_from_floor_prior,
     floorplan_from_geometry,
     format_aggregate,
     iter_nyu_h5,
     iter_nyu_parquet,
     run_experiment,
 )
+from .pipeline.real import cloud_from_depth, geometry_summary
 from .pipeline.reconstruct import reconstruct
 from .schema import Floorplan, Opening, Room
 
@@ -257,6 +260,67 @@ def cmd_real(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_photos(args: argparse.Namespace) -> int:
+    """Arbitrary photos (no ground truth) -> metric depth -> floorplan, one view per room.
+
+    Metric scale comes from the floor plane plus the camera-height prior; ``real`` uses NYU
+    ground truth instead. Expect ~0.30 AbsRel for scale recovered this way vs ~0.17 when
+    aligned to ground truth.
+    """
+    from PIL import Image
+
+    images = collect_images(args.images)
+    if not images:
+        print(f"no images under {args.images!r}", file=sys.stderr)
+        return 2
+    model = OnnxDepth(path=args.model)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    index = []
+    print(f"{len(images)} photos | camera height prior {args.camera_height} m, "
+          f"hfov {args.hfov}deg")
+    for path in images:
+        rgb = np.array(Image.open(path).convert("RGB"))
+        h, w = rgb.shape[:2]
+        K = intrinsics_from_fov(w, h, args.hfov)
+        pred = model.predict(rgb)
+        m = metric_from_floor_prior(pred, K, camera_height=args.camera_height)
+        if not m.get("ok"):
+            print(f"  {path.name:<26} skipped: {m.get('reason')}")
+            continue
+        cloud = cloud_from_depth(m["depth"], K)
+        # scale recovery fixes the floor at exactly -camera_height; do not re-estimate it
+        geom = geometry_summary(cloud, floor_y=-args.camera_height)
+        if geom is None:
+            print(f"  {path.name:<26} skipped: box fit failed")
+            continue
+        plan = floorplan_from_geometry(geom, path.name, "photo")
+        plan.meta["floor_residual_m"] = round(float(m["floor_residual"]), 3)
+        plan.meta["scale_source"] = f"floor plane + {args.camera_height} m camera prior"
+        dest = out / f"{path.stem}.json"
+        plan.save(str(dest))
+        room = plan.rooms[0]
+        print(f"  {path.name:<26} {geom['width']:.1f}x{geom['depth']:.1f} m "
+              f"({geom['area']:.1f} m2)  wall_support={geom['confidence']:.2f} "
+              f"floor_res={m['floor_residual']:.2f} m "
+              f"(floor inliers {m.get('floor_inlier_ratio', 0)*100:.0f}%)  "
+              f"doors={len(geom['openings'])}")
+        index.append({"image": path.name, "plan": str(dest),
+                      "area": round(geom["area"], 2),
+                      "width": round(geom["width"], 2), "depth": round(geom["depth"], 2),
+                      "wall_support": round(geom["confidence"], 3),
+                      "floor_residual": round(float(m["floor_residual"]), 3),
+                      "openings": len(geom["openings"])})
+
+    (out / "index.json").write_text(json.dumps(index, indent=2))
+    print(f"\nwrote {len(index)} plans to {out}")
+    if index:
+        print(f"\nview:\n  open 'http://localhost:8000/viewer/floorplan.html"
+              f"?src=../{out}/{Path(index[0]['plan']).name}'")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pin3d", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -286,6 +350,14 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--door-radius", type=float, default=0.5)
     e.add_argument("--json", action="store_true")
     e.set_defaults(func=cmd_eval)
+
+    ph = sub.add_parser("photos", help="arbitrary photos (no GT) -> floorplan per view")
+    ph.add_argument("--images", default="samples")
+    ph.add_argument("--model", default="models/depth_anything_v2_small.onnx")
+    ph.add_argument("--out", default="out/photos")
+    ph.add_argument("--camera-height", type=float, default=1.5)
+    ph.add_argument("--hfov", type=float, default=68.0)
+    ph.set_defaults(func=cmd_photos)
 
     r = sub.add_parser("real", help="real photos + ground-truth depth (NYU Depth V2)")
     r.add_argument("--parquet", default=None, help="NYU depth_v2 parquet shard")

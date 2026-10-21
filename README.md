@@ -82,11 +82,47 @@ Which is the design doc's thesis, now measured: **model quality is not the const
 geometry is.** Getting real numbers out of one photo per room is not possible; the box needs
 multiple views.
 
+## Sample photos
+
+```bash
+python scripts/fetch_samples.py --count 10     # CC-licensed interiors from Wikimedia Commons
+.venv/bin/python -m pin3d.cli photos --images samples --out out/photos
+open 'http://localhost:8000/viewer/floorplan.html?src=../out/photos/sample05.json'
+```
+
+Metric scale has no ground truth here, so it comes from a **floor plane + a 1.5 m camera-height
+prior**, which solves a linear system in (scale, offset, height) — plain "scale by camera
+height" is off by ~2x because the model's offset `b` is the same order as the scene depth.
+
+Result on 7 real photos:
+
+| photo | box | wall support | floor inliers |
+|---|---|---|---|
+| sample05 | 6.3 x 3.3 m | 0.35 | 88% |
+| sample06 | 5.1 x 2.6 m | 0.51 | 79% |
+| sample03 | 9.6 x 3.6 m | 0.37 | 75% |
+| sample10 | **5.7 x 1.4 m** | 0.88 | **31%** |
+| sample08 | 4.9 x 5.5 m | 0.34 | **14%** |
+
+`sample10` is a clean empty apartment photographed from a doorway; the true room is roughly
+8 x 5 m. We got 5.7 x 1.4 m and reported 0.88 wall support — **confidently wrong**. The floor
+inlier ratio (31%) is the only column that flags it, because a foreground plant occupied the
+bottom band and the floor fit locked onto it.
+
+Also: **zero doors detected** across all seven photos. The wall-gap detector expects a closed
+room boundary; a single view never provides one.
+
+So the sample-photo path runs end to end and produces viewable plans, but the dimensions are
+only trustworthy when the floor is unoccluded and the view is wide. That is the measured
+single-view limit, not a missing feature. `--camera-height` and `--hfov` are exposed because
+both are priors and both matter.
+
 ## Commands
 
 ```bash
 python -m pin3d.cli stub --out examples            # synthetic end-to-end + scored report
 python -m pin3d.cli real --parquet shard.parquet --limit 150   # real photos + GT depth
+python -m pin3d.cli photos --images samples                   # arbitrary photos, no GT
 python -m pin3d.cli reconstruct --images samples/ --backend stub --out out/plan.json
 python -m pin3d.cli reconstruct --images samples/ --backend vggt  # needs torch + vggt
 python -m pin3d.cli eval    --pred out/plan.json --gt examples/floorplan_gt.json
