@@ -143,6 +143,24 @@ python -m pin3d.cli validate --plan out/plan.json
 Editing matters: automatic floorplans are never right, and a room you can fix in ten seconds
 beats a 3D scene you cannot fix at all.
 
+## Room model: wall planes
+
+Rooms are reconstructed as detected **vertical wall planes** intersected as half-planes, not as
+a bounding rectangle. Measured against known truth with controlled visibility:
+
+| case | box IoU | planes IoU |
+|---|---|---|
+| panorama, clean | 0.995 | **1.000** |
+| panorama + furniture | 0.991 | **0.999** |
+| corner view, 3 walls | 0.747 | **0.932** |
+| narrow view, 2 walls | 0.005 | **0.912** |
+| corner + furniture | **0.742** | 0.135 |
+| L-shaped room | **0.749** | 0.334 |
+
+Planes win where it matters (partial single views) and lose on non-convex rooms and tall
+furniture. The pipeline uses planes when they are bounded *and* supported, otherwise falls back
+to the box and records why. Reproduce with `python scripts/plane_model_eval.py`.
+
 ## What is real vs. stubbed
 
 | Component | State |
@@ -150,6 +168,7 @@ beats a 3D scene you cannot fix at all.
 | Schema, validation, JSON round-trip | real |
 | Geometry (IoU, hull, min-area rect, rectification) | real, tested |
 | Room box fit (density filter + outer-median wall planes) | real, tested |
+| Wall-plane room model (half-plane intersection) | real, tested — convex rooms only |
 | Door detection (point-cloud wall gaps) | real, tested |
 | Global 2D assembly (BFS with hints, greedy without) | real, tested |
 | Metrics vs. ground truth | real, tested |

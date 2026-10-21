@@ -14,10 +14,12 @@ import numpy as np
 
 from ..geometry import (
     as_poly,
+    convex_hull,
     dot_rows,
     ensure_ccw,
     min_area_rect,
     polygon_area,
+    polygon_from_halfplanes,
     rectify_polygon,
     rot_points,
     snap_angle,
@@ -334,3 +336,249 @@ def detect_wall_segments(
 
     segments.sort(key=lambda s: -s.inliers)
     return segments
+
+
+# --------------------------------------------------------------------------
+# wall-plane reconstruction (replaces the bounding-box room model)
+# --------------------------------------------------------------------------
+@dataclass
+class WallPlane:
+    """A detected vertical wall, oriented so the room lies on the ``n . x <= d`` side."""
+
+    normal: np.ndarray      # (2,) inward unit normal, floorplan coords
+    offset: float           # n . x = offset
+    midpoint: np.ndarray    # a point on the plane
+    support: int            # inlier points
+    length: float           # extent of the observed run
+    y_min: float
+    y_max: float
+
+    @property
+    def angle_deg(self) -> float:
+        return float(np.degrees(np.arctan2(self.normal[1], self.normal[0])))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "angle_deg": round(self.angle_deg, 2),
+            "offset": round(float(self.offset), 3),
+            "midpoint": [round(float(v), 3) for v in self.midpoint],
+            "support": int(self.support),
+            "length": round(float(self.length), 2),
+            "y_range": [round(float(self.y_min), 2), round(float(self.y_max), 2)],
+        }
+
+
+@dataclass
+class RoomPolygon:
+    polygon: np.ndarray
+    floor_y: float
+    ceiling: float
+    planes: List[WallPlane]
+    binding: List[int]
+    bounded: bool
+    support: float
+    n_points: int
+    method: str = "wall_planes"
+
+    @property
+    def area(self) -> float:
+        return polygon_area(self.polygon)
+
+    @property
+    def size(self) -> Tuple[float, float]:
+        p = as_poly(self.polygon)
+        return float(np.ptp(p[:, 0])), float(np.ptp(p[:, 1]))
+
+
+def planes_from_segments(
+    segments: Sequence[WallSegment], camera_xy: Sequence[float] = (0.0, 0.0)
+) -> List[WallPlane]:
+    """Turn 2D wall segments into inward-oriented half-planes."""
+    c = np.asarray(camera_xy, dtype=float)
+    out: List[WallPlane] = []
+    for seg in segments:
+        n = np.asarray(seg.normal, dtype=float)
+        norm = float(np.linalg.norm(n))
+        if norm < 1e-9:
+            continue
+        n = n / norm
+        mid = seg.midpoint
+        d = float(n @ mid)
+        # orient so the camera is on the room side of the wall
+        if float(n @ c) > d:
+            n = -n
+            d = -d
+        out.append(WallPlane(
+            normal=n, offset=d, midpoint=mid, support=int(seg.inliers),
+            length=float(seg.length), y_min=float(seg.y_min), y_max=float(seg.y_max),
+        ))
+    return out
+
+
+def merge_coplanar(
+    planes: Sequence[WallPlane], angle_eps_deg: float = 6.0, offset_eps: float = 0.14
+) -> List[WallPlane]:
+    """Merge planes that are the same physical wall (split by a door, or re-detected)."""
+    merged: List[WallPlane] = []
+    for p in sorted(planes, key=lambda q: -q.support):
+        placed = False
+        for i, q in enumerate(merged):
+            dang = abs(((p.angle_deg - q.angle_deg + 90.0) % 180.0) - 90.0)
+            if dang > angle_eps_deg:
+                continue
+            if abs(float(p.normal @ q.midpoint) - p.offset) > offset_eps:
+                continue
+            total = q.support + p.support
+            w = p.support / max(total, 1)
+            merged[i] = WallPlane(
+                normal=(1 - w) * q.normal + w * p.normal,
+                offset=(1 - w) * q.offset + w * p.offset,
+                midpoint=(1 - w) * q.midpoint + w * p.midpoint,
+                support=total,
+                length=q.length + p.length,
+                y_min=min(q.y_min, p.y_min), y_max=max(q.y_max, p.y_max),
+            )
+            placed = True
+            break
+        if not placed:
+            merged.append(p)
+    for m in merged:
+        m.normal = m.normal / max(float(np.linalg.norm(m.normal)), 1e-9)
+    return merged
+
+
+def snap_manhattan(
+    planes: Sequence[WallPlane], angle_tol_deg: float = 22.0
+) -> Tuple[List[WallPlane], float]:
+    """Snap wall azimuths to a common orthogonal lattice.
+
+    The lattice angle is the circular mean of ``4 * theta`` over the planes, which is the
+    standard trick for averaging directions modulo 90 degrees.
+    """
+    if not planes:
+        return [], 0.0
+    thetas = np.array([np.arctan2(p.normal[1], p.normal[0]) for p in planes])
+    weights = np.array([max(p.support, 1) for p in planes], dtype=float)
+    acc = np.sum(weights * np.exp(4j * thetas))
+    dominant = (np.angle(acc) / 4.0) if abs(acc) > 1e-12 else 0.0
+    out: List[WallPlane] = []
+    for p in planes:
+        theta = np.arctan2(p.normal[1], p.normal[0])
+        dev = ((np.degrees(theta - dominant) + 45.0) % 90.0) - 45.0
+        if abs(dev) > angle_tol_deg:
+            continue                       # not part of the Manhattan structure
+        snapped = theta - np.radians(dev)
+        n = np.array([np.cos(snapped), np.sin(snapped)])
+        out.append(WallPlane(
+            normal=n, offset=float(n @ p.midpoint), midpoint=p.midpoint,
+            support=p.support, length=p.length, y_min=p.y_min, y_max=p.y_max,
+        ))
+    return out, float(np.degrees(dominant) % 90.0)
+
+
+def plane_support(points: np.ndarray, polygon: np.ndarray, floor_y: float,
+                  band: Tuple[float, float] = (0.8, 1.6), max_dist: float = 0.20) -> float:
+    """Fraction of torso-band points lying on the polygon boundary."""
+    shifted = np.asarray(points, dtype=float).copy()
+    shifted[:, UP_AXIS] -= floor_y
+    b = band_points(shifted, *band)
+    if len(b) < 20:
+        return 0.0
+    d = distance_to_polygon_boundary(b[:, [0, 2]], polygon)
+    return float(np.mean(d <= max_dist))
+
+
+def fit_room_polygon(
+    points: np.ndarray,
+    camera_xy: Optional[Sequence[float]] = None,
+    floor_y: Optional[float] = None,
+    band: Tuple[float, float] = (0.5, 1.9),
+    min_planes: int = 3,
+    min_support: int = 40,
+    extent_cap: float = 25.0,
+    snap: bool = True,
+) -> Optional[RoomPolygon]:
+    """Reconstruct a room from detected vertical wall planes.
+
+    Why this replaces ``fit_room_box``: a bounding rectangle of a torso slice is fitted to
+    whatever happens to be there (furniture, a plant, the far room through a doorway) and it
+    cannot generalise — measured held-out support was 0.08 on real data. Wall planes carry
+    *orientation*, so each one constrains which side the room is on, and the room is their
+    half-plane intersection. Walls that were never seen leave the polygon unbounded on that
+    side, which is reported instead of being invented.
+    """
+    pts = np.asarray(points, dtype=float).reshape(-1, 3)
+    if len(pts) < 200:
+        return None
+    est_floor, est_ceiling = estimate_floor_ceiling(pts)
+    fy = float(floor_y) if floor_y is not None else est_floor
+    ceiling = (est_ceiling - est_floor + fy) if est_ceiling is not None else 2.7
+    shifted = pts.copy()
+    shifted[:, UP_AXIS] -= fy
+
+    c = np.asarray(camera_xy, dtype=float) if camera_xy is not None else np.array([0.0, 0.0])
+    horiz = np.linalg.norm(shifted[:, [0, 2]] - c[None, :], axis=1)
+    extent = float(np.clip(1.5 * np.percentile(horiz, 95), 6.0, extent_cap))
+
+    segments = detect_wall_segments(shifted, band=band, min_inliers=min_support)
+    if not segments:
+        return None
+
+    # A wall spans the band; a table top or a wardrobe face does not. Without this the
+    # furniture planes cut the room into pieces (measured: IoU 1.00 -> 0.33 on a clean room
+    # once two boxes of furniture were added).
+    band_height = float(band[1] - band[0])
+    segments = [sg for sg in segments
+                if (sg.y_max - sg.y_min) >= 0.7 * band_height and sg.length >= 0.8]
+    if not segments:
+        return None
+    planes = planes_from_segments(segments, camera_xy=c)
+    planes = merge_coplanar(planes)
+    if snap:
+        planes, _ = snap_manhattan(planes)
+    if not planes:
+        return None
+
+    halfplanes = [(p.normal, p.offset) for p in planes]
+
+    # Bound the room by the floor we actually observed. Without this, an open view (walls
+    # seen on one or two sides) leaves the half-plane intersection unbounded and produces a
+    # 96 m2 "room" whose boundary still scores well on support. The floor footprint is a
+    # crude regulariser, but it is observed rather than invented.
+    floor_pts = shifted[shifted[:, UP_AXIS] < 0.25][:, [0, 2]]
+    if len(floor_pts) >= 120:
+        hull = convex_hull(floor_pts)
+        # Only trust the floor footprint when it is actually a room-sized patch. A desk or a
+        # rug occludes the floor and leaves a 1-2 m2 hull, which would clip the room away
+        # (observed on TUM: a 5.8 m2 room collapsing to 0.6 m2).
+        if len(hull) < 4 or polygon_area(hull) < 3.0:
+            hull = None
+        if hull is not None:
+            cen = hull.mean(axis=0)
+            for i in range(len(hull)):
+                p0, p1 = hull[i], hull[(i + 1) % len(hull)]
+                d = p1 - p0
+                nrm = np.array([-d[1], d[0]])
+                ln = float(np.linalg.norm(nrm))
+                if ln < 1e-9:
+                    continue
+                nrm = nrm / ln
+                if float(nrm @ cen) > float(nrm @ p0):   # ensure interior is the <= side
+                    nrm = -nrm
+                halfplanes.append((nrm, float(nrm @ p0) + 0.15))
+
+    poly, binding = polygon_from_halfplanes(halfplanes, centre=c, extent=extent)
+    binding = [b for b in binding if b < len(planes)]
+    if len(poly) < 3 or polygon_area(poly) < 0.5:
+        return None
+
+    return RoomPolygon(
+        polygon=ensure_ccw(poly),
+        floor_y=fy,
+        ceiling=float(np.clip(ceiling, 1.5, 6.0)),
+        planes=planes,
+        binding=binding,
+        bounded=len(binding) >= min_planes,
+        support=plane_support(pts, poly, fy),
+        n_points=int(len(pts)),
+    )

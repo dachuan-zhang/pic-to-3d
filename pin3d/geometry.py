@@ -352,3 +352,63 @@ def wall_normal(p0: np.ndarray, p1: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(d)
     d = d / n if n > 1e-12 else np.array([1.0, 0.0])
     return np.array([-d[1], d[0]])
+
+
+# --------------------------------------------------------------------------
+# half-plane intersection (used to turn wall planes into a room polygon)
+# --------------------------------------------------------------------------
+def clip_halfplane(poly: Poly, normal: np.ndarray, offset: float, eps: float = 1e-9) -> Poly:
+    """Clip a convex polygon to ``normal . x <= offset`` (Sutherland-Hodgman)."""
+    p = as_poly(poly)
+    if len(p) < 3:
+        return p
+    n = np.asarray(normal, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    d = float(offset) / max(float(np.linalg.norm(normal)), 1e-12)
+    vals = dot_rows(p, n) - d
+    out: List[np.ndarray] = []
+    for i in range(len(p)):
+        j = (i - 1) % len(p)
+        cur, prev = p[i], p[j]
+        vc, vp = vals[i], vals[j]
+        if vc <= eps:                      # current inside
+            if vp > eps:                   # entering
+                t = vp / (vp - vc)
+                out.append(prev + t * (cur - prev))
+            out.append(cur)
+        elif vp <= eps:                    # leaving
+            t = vp / (vp - vc)
+            out.append(prev + t * (cur - prev))
+    return np.array(out) if len(out) >= 3 else np.zeros((0, 2))
+
+
+def polygon_from_halfplanes(
+    planes: Sequence[Tuple[np.ndarray, float]],
+    centre: Sequence[float] = (0.0, 0.0),
+    extent: float = 12.0,
+) -> Tuple[Poly, List[int]]:
+    """Intersect half-planes ``n_i . x <= d_i`` into a bounded polygon.
+
+    Starts from a generous square around ``centre`` and clips. Returns the polygon plus the
+    indices of planes that actually cut it — a plane that never binds is a wall that was
+    detected but is not a room boundary (e.g. a wardrobe face), and the caller should not
+    treat the room as closed on that side.
+    """
+    c = np.asarray(centre, dtype=float)
+    poly = np.array([
+        [c[0] - extent, c[1] - extent], [c[0] + extent, c[1] - extent],
+        [c[0] + extent, c[1] + extent], [c[0] - extent, c[1] + extent],
+    ])
+    binding: List[int] = []
+    for i, (n, d) in enumerate(planes):
+        before = poly
+        poly = clip_halfplane(poly, n, d)
+        if len(poly) < 3:
+            return np.zeros((0, 2)), []
+        if len(poly) != len(before) or not np.allclose(poly, before):
+            binding.append(i)
+    return ensure_ccw(poly), binding
+
+
+def polygon_perimeter(poly: Poly) -> float:
+    return float(edge_lengths(poly).sum())

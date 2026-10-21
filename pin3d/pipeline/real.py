@@ -218,6 +218,84 @@ def geometry_summary(
     cloud: np.ndarray,
     detector: Optional[Any] = None,
     floor_y: Optional[float] = None,
+    camera_xy: Optional[Sequence[float]] = None,
+    method: str = "auto",
+) -> Optional[Dict[str, Any]]:
+    """Room model for one cloud.
+
+    Policy, from the measurements in docs/BRAINSTORM.md §15e: use **wall planes** when they
+    close a room (bounded), because on partial views they are far more accurate than a
+    bounding rectangle (IoU 0.91 vs 0.01). Fall back to the **box** when the planes do not
+    close — an open plane intersection is a 175 m2 polygon, and emitting that would be worse
+    than a wrong box that at least looks like a room. Either way the method used is recorded.
+    """
+    from .planes import fit_room_polygon
+
+    room = None
+    if method in ("auto", "planes"):
+        room = fit_room_polygon(cloud, camera_xy=camera_xy, floor_y=floor_y)
+    # `bounded` alone is not sufficient: furniture faces can close a false room whose
+    # wall support is ~0.04. Require the polygon to actually explain the points.
+    if room is not None and room.bounded and room.support >= 0.25:
+        w, d = room.size
+        polygon, fy, ceiling = room.polygon, room.floor_y, room.ceiling
+        top_y = fy + ceiling
+        support = room.support
+        used, n_planes, bounded = "wall_planes", len(room.planes), True
+        box_obj = None
+    else:
+        box = fit_room_box(cloud, floor_y=floor_y)
+        if box is None:
+            return None
+        w, d = box.size
+        polygon, fy, ceiling = box.polygon, box.floor_y, box.ceiling
+        top_y = fy + ceiling
+        support = box.confidence
+        used = "box" if room is None else "box (planes unbounded)"
+        n_planes = 0 if room is None else len(room.planes)
+        bounded = False
+        box_obj = box
+
+    ceiling_support = float(np.mean(np.abs(cloud[:, 1] - top_y) < 0.15))
+    ceiling_valid = ceiling_support >= CEILING_SUPPORT_MIN
+    openings: List[Opening] = []
+    if detector is not None:
+        try:
+            openings = detector.detect(cloud, polygon, floor_y=fy, ceiling=ceiling)
+        except Exception:
+            openings = []
+    return {
+        "box": box_obj,
+        "polygon": polygon,
+        "floor_y": float(fy),
+        "width": float(w),
+        "depth": float(d),
+        "area": float(_poly_area(polygon)),
+        "ceiling": float(ceiling),
+        "ceiling_support": ceiling_support,
+        "ceiling_valid": ceiling_valid,
+        "camera_height": float(-fy),
+        "confidence": float(support),
+        "method": used,
+        "n_planes": int(n_planes),
+        "bounded": bool(bounded),
+        "openings": openings,
+        "points": int(len(cloud)),
+    }
+
+
+def _poly_area(poly) -> float:
+    p = np.asarray(poly, dtype=float).reshape(-1, 2)
+    if len(p) < 3:
+        return 0.0
+    x, y = p[:, 0], p[:, 1]
+    return abs(0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _legacy_geometry_summary(
+    cloud: np.ndarray,
+    detector: Optional[Any] = None,
+    floor_y: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     box = fit_room_box(cloud, floor_y=floor_y)
     if box is None:
@@ -434,21 +512,23 @@ def floorplan_from_geometry(
     assumed_ceiling: float = 2.7,
 ) -> Floorplan:
     """A single view cannot close a room or see its ceiling; the plan says so in `meta`."""
-    box = geom["box"]
     ceiling_valid = bool(geom.get("ceiling_valid", False))
-    ceiling = float(box.ceiling) if ceiling_valid else assumed_ceiling
+    ceiling = float(geom["ceiling"]) if ceiling_valid else assumed_ceiling
     room = Room(
         id="r0",
         label=label,
-        polygon=box.polygon,
+        polygon=np.asarray(geom["polygon"], dtype=float),
         ceiling=ceiling,
         openings=list(geom["openings"]),
-        confidence=float(box.confidence),
+        confidence=float(geom["confidence"]),
         meta={
-            "method": box.method,
+            "method": geom.get("method", "box"),
+            "room_model": geom.get("method", "box"),
+            "bounded": bool(geom.get("bounded", False)),
+            "n_wall_planes": int(geom.get("n_planes", 0)),
             "source": source,
-            "camera_height": round(-float(box.floor_y), 3),
-            "n_points": int(box.n_points),
+            "camera_height": round(float(geom.get("camera_height", 0.0)), 3),
+            "n_points": int(geom.get("points", 0)),
             "ceiling_source": "estimated" if ceiling_valid else "assumed 2.7 m",
             "ceiling_support": round(float(geom.get("ceiling_support", 0.0)), 4),
             "wall_support": round(float(geom.get("confidence", 0.0)), 4),

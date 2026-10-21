@@ -237,7 +237,8 @@ VLM ("kitchen adjacent to living room"), scored against ZInD.
 | 3 | Real-data eval vs. ground truth ▶ ZInD is gated; used NYU Depth V2 instead (§15b) | **done** |
 | 4 | Room clustering / identity from flat listing photos | next |
 | 5 | Door detection upgraded (segmentation / VLM) | next |
-| 6 | Depth-parallax 2.5D upgrade per room | later |
+| 6 | Wall-plane room model (replaces the bounding box) | **done (partial: convex only)** |
+| 6b | Depth-parallax 2.5D upgrade per room | later |
 | 7 | 3DGS hero nodes (real parallax where users linger) | later |
 | 8 | Crawler + authoring UI | later, and last |
 
@@ -492,6 +493,56 @@ Three bugs found while building this, all of the kind that silently produce wron
 - **Comparing absolute rotations across SfM and ground truth** is meaningless because SfM has
   an arbitrary global frame; it reported 139 degrees of "error". Needs a Procrustes alignment
   first — or, better, don't report rotation error at all until there are enough views to align.
+
+### 15e. Wall planes instead of a bounding box
+
+§15d's conclusion was that the room *model* is the blocker, not the view count: a box fitted on
+three views explained 8% of a fourth even with perfect poses and perfect depth. So the box was
+replaced with **detected vertical wall planes**, oriented with inward normals and intersected as
+half-planes (`pin3d.pipeline.planes.fit_room_polygon`).
+
+Why planes could help: a rectangle is defined by four *extents*, so it is fitted to whatever is
+in the torso band — furniture, a plant, the room next door. A plane carries *orientation*, so it
+constrains which side the room is on, and a wall that was never seen leaves the polygon open on
+that side, which can be reported instead of invented.
+
+Measured with controlled visibility (`scripts/plane_model_eval.py`), IoU against known truth:
+
+| case | box | planes |
+|---|---|---|
+| panorama, clean rectangle | 0.995 | **1.000** |
+| panorama + furniture | 0.991 | **0.999** |
+| corner view 120 deg (3 walls) | 0.747 | **0.932** |
+| narrow view 68 deg (2 walls) | **0.005** | **0.912** |
+| corner view + furniture | **0.742** | 0.135 |
+| L-shaped room, panorama | **0.749** | 0.334 |
+| L-shaped room, corner view | **0.595** | 0.323 |
+
+Three fixes were needed to get there, each found by measurement:
+
+- **Walls must span the band.** A table top or a wardrobe face does not. Without this filter,
+  adding two boxes of furniture dropped the panorama IoU from 1.00 to 0.33.
+- **Bound the room by the observed floor footprint.** An open view (one or two walls) otherwise
+  leaves the half-plane intersection unbounded and yields a 96 m² "room" whose boundary still
+  scores 0.97 on support — support alone is gameable.
+- **Require support >= 0.25 as well as `bounded`.** Furniture faces can close a *false* room;
+  on real photos this showed up as `bounded=True` with support 0.04.
+
+Honest limits, both measured, both left in place rather than papered over:
+
+- **Half-plane intersection cannot represent a non-convex room.** An L-shape is the intersection
+  of *some* of its walls, so the polygon loses the notch. This needs a different construction
+  (wall arrangement + cell extraction), not better tuning.
+- **Tall furniture is indistinguishable from a wall** by vertical extent. The corner+furniture
+  case above is that failure (0.135).
+
+Policy now in `geometry_summary` (`docs` §9 item 4): use planes when they are bounded *and*
+supported, else fall back to the box and record `"box (planes unbounded)"` in the plan. On the
+seven sample photos that means 2 plans use planes, 5 fall back with the reason attached.
+
+On TUM fr1_room the plane model does not close the room at all (its views see mostly one wall),
+so it reports `bounded=False` and a 175 m² polygon while the box reports 5.8 m² with held-out
+support 0.00. Neither model is usable on that scene; the difference is that one of them says so.
 
 ## 16. Open questions
 

@@ -107,7 +107,8 @@ def load_tum(root: str, limit: Optional[int] = None) -> List[Frame]:
     return frames
 
 
-def unproject_raw(depth: np.ndarray, K: np.ndarray, stride: int = 2) -> np.ndarray:
+def unproject_raw(depth: np.ndarray, K: np.ndarray, stride: int = 2,
+                  max_depth: float = 5.0) -> np.ndarray:
     """Depth -> camera-frame points in TUM's own convention: x right, y DOWN, z forward.
 
     Deliberately *not* ``cloud_from_depth``: that one flips Y for our internal +Y-up world,
@@ -118,7 +119,10 @@ def unproject_raw(depth: np.ndarray, K: np.ndarray, stride: int = 2) -> np.ndarr
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     u, v = np.meshgrid(np.arange(0, depth.shape[1], stride, dtype=np.float32),
                        np.arange(0, depth.shape[0], stride, dtype=np.float32))
-    m = np.isfinite(d) & (d > 0.3) & (d < 8.0)
+    # TUM fr1 is Kinect v1: valid range is ~0.5-5 m. Accepting 8 m let invalid far
+    # readings through, which put 41% of points *below the floor* and wrecked every
+    # downstream estimate.
+    m = np.isfinite(d) & (d > 0.3) & (d < max_depth)
     z = d[m]
     return np.stack([(u[m] - cx) / fx * z, (v[m] - cy) / fy * z, z], axis=1)
 
