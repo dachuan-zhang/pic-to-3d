@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pic-to-3d — floorplan walkthrough</title>
+<style>
+  :root {
+    --bg: #10131a; --panel: #1a1f2a; --line: #2a3240; --text: #dbe3ef;
+    --dim: #8794a8; --accent: #4fc3f7; --door: #7ee787; --warn: #ffab70;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
+  #app { display: grid; grid-template-columns: 1fr 300px; height: 100%; }
+  #stage { position: relative; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #panel { background: var(--panel); border-left: 1px solid var(--line);
+    padding: 14px; overflow-y: auto; }
+  h1 { font-size: 14px; margin: 0 0 4px; letter-spacing: .04em; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--dim); margin-bottom: 14px; font-size: 11px; }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  button { background: #232b38; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.on { background: var(--accent); color: #06121a; border-color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  td { padding: 3px 2px; border-bottom: 1px solid var(--line); }
+  td.n { text-align: right; color: var(--dim); }
+  .k { color: var(--dim); }
+  .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 5px; vertical-align: middle; }
+  #hud { position: absolute; left: 12px; bottom: 12px; font-size: 11px; color: var(--dim);
+    background: rgba(16,19,26,.82); padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--line); pointer-events: none; }
+  #err { position: absolute; inset: 0; display: none; place-items: center; padding: 24px;
+    text-align: center; color: var(--warn); }
+  .hint { color: var(--dim); font-size: 11px; margin-top: 10px; }
+  kbd { background: #232b38; border: 1px solid var(--line); border-radius: 3px;
+    padding: 0 4px; font-size: 10px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <div id="hud">loading…</div>
+    <div id="err"></div>
+  </div>
+  <div id="panel">
+    <h1>pic-to-3d <span>v0</span></h1>
+    <div class="sub" id="src">floorplan…</div>
+    <div class="row">
+      <button id="mode2d" class="on">2D plan</button>
+      <button id="mode3d">3D walk</button>
+    </div>
+    <div class="row">
+      <button id="snap">snap 5cm</button>
+      <button id="export">export JSON</button>
+    </div>
+    <div class="row">
+      <button id="load">load JSON…</button>
+      <input id="file" type="file" accept=".json" hidden />
+    </div>
+    <div id="rooms"></div>
+    <div class="hint" id="hint2d">
+      drag a room to move it · drag empty space to pan · wheel to zoom<br />
+      an edited plan is only as good as its doors — check the green marks
+    </div>
+    <div class="hint" id="hint3d" hidden>
+      click to look · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move ·
+      <kbd>shift</kbd> run · <kbd>esc</kbd> release<br />
+      camera is clipped to room polygons, so you cannot walk through walls
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const SRC = params.get('src') || '../examples/floorplan.json';
+
+let plan = { units: 'meters', rooms: [], adjacency: [], meta: {} };
+let snapStep = 0.05;
+let mode = '2d';
+let roomColors = {};
+
+const PALETTE = ['#4fc3f7','#7ee787','#ffab70','#d2a8ff','#ffd166','#ff7b72',
+                 '#79c0ff','#56d4dd','#f778ba','#a5d6ff'];
+
+// ---------------------------------------------------------------------------
+// shared geometry helpers (mirrored in the 2D and 3D paths)
+// ---------------------------------------------------------------------------
+const area = (poly) => {
+  let s = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i], [x1, y1] = poly[(i + 1) % poly.length];
+    s += x0 * y1 - x1 * y0;
+  }
+  return Math.abs(s) / 2;
+};
+const centroid = (poly) => {
+  let a = 0, cx = 0, cy = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i], [x1, y1] = poly[(i + 1) % poly.length];
+    const cross = x0 * y1 - x1 * y0;
+    a += cross; cx += (x0 + x1) * cross; cy += (y0 + y1) * cross;
+  }
+  if (Math.abs(a) < 1e-9) {
+    const n = poly.length;
+    return [poly.reduce((s, p) => s + p[0], 0) / n, poly.reduce((s, p) => s + p[1], 0) / n];
+  }
+  return [cx / (3 * a), cy / (3 * a)];
+};
+const inPoly = ([px, py], poly) => {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+};
+const distToSeg = (p, a, b) => {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const L2 = dx * dx + dy * dy;
+  let t = L2 ? ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy));
+};
+const openingSpan = (op, L) => {
+  const c = op.t * L, w = op.width;
+  return [Math.max(0, c - w / 2), Math.min(L, c + w / 2)];
+};
+const openSpans = (room) => {
+  const out = [];
+  (room.openings || []).forEach((op) => {
+    const poly = room.polygon, n = poly.length;
+    const i = ((op.wall % n) + n) % n;
+    const a = poly[i], b = poly[(i + 1) % n];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L < 1e-9) return;
+    out.push({ ...op, wall: i, L, span: openingSpan(op, L), a, b });
+  });
+  return out;
+};
+
+// ---------------------------------------------------------------------------
+// load
+// ---------------------------------------------------------------------------
+async function loadPlan(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  applyPlan(await res.json());
+}
+function applyPlan(next) {
+  plan = next;
+  roomColors = {};
+  (plan.rooms || []).forEach((r, i) => { roomColors[r.id] = PALETTE[i % PALETTE.length]; });
+  document.getElementById('src').textContent =
+    `${plan.rooms.length} rooms · ${(plan.rooms.reduce((s, r) => s + area(r.polygon), 0)).toFixed(1)} m²`;
+  renderSidebar();
+  fitView();
+  rebuild3D();
+}
+function renderSidebar() {
+  const rows = plan.rooms.map((r) => {
+    const doors = (r.openings || []).length;
+    const conf = r.confidence != null ? (r.confidence * 100).toFixed(0) + '%' : '—';
+    return `<tr title="${(r.meta && r.meta.method) || ''}">
+      <td><span class="swatch" style="background:${roomColors[r.id]}"></span>${r.label || r.id}</td>
+      <td class="n">${area(r.polygon).toFixed(1)} m²</td>
+      <td class="n">${r.ceiling.toFixed(2)}</td>
+      <td class="n">${doors}</td>
+      <td class="n">${conf}</td></tr>`;
+  }).join('');
+  document.getElementById('rooms').innerHTML = `<table>
+    <tr><td class="k">room</td><td class="n k">area</td><td class="n k">ceil</td>
+    <td class="n k">doors</td><td class="n k">conf</td></tr>${rows}</table>`;
+}
+
+// ---------------------------------------------------------------------------
+// 2D editor
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d');
+let view = { scale: 60, ox: 40, oy: 40 };
+let selected = null, dragging = false, panning = false;
+let dragStart = null, roomStart = null, panStart = null;
+
+const toScreen = ([x, y]) => [x * view.scale + view.ox, y * view.scale + view.oy];
+const toWorld = (sx, sy) => [(sx - view.ox) / view.scale, (sy - view.oy) / view.scale];
+
+function fitView() {
+  const rooms = plan.rooms || [];
+  if (!rooms.length) return;
+  const pts = rooms.flatMap((r) => r.polygon);
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = Math.max(maxX - minX, 1), h = Math.max(maxY - minY, 1);
+  const pad = 46;
+  view.scale = Math.min((canvas.width - 2 * pad) / w, (canvas.height - 2 * pad) / h);
+  view.scale = Math.max(8, Math.min(view.scale, 300));
+  view.ox = pad - minX * view.scale + Math.max(0, (canvas.width - 2 * pad - w * view.scale) / 2);
+  view.oy = pad - minY * view.scale + Math.max(0, (canvas.height - 2 * pad - h * view.scale) / 2);
+}
+
+function draw2D() {
+  const { width: W, height: H } = canvas;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#10131a'; ctx.fillRect(0, 0, W, H);
+
+  // metric grid
+  const step = view.scale * (view.scale < 22 ? 1 : 0.5);
+  ctx.strokeStyle = '#1b212c'; ctx.lineWidth = 1;
+  const [wx0, wy0] = toWorld(0, 0);
+  for (let x = Math.floor(wx0 / (step / view.scale)) * (step / view.scale); ; x += step / view.scale) {
+    const sx = x * view.scale + view.ox;
+    if (sx > W) break;
+    if (sx < -step) continue;
+    ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke();
+  }
+  for (let y = wy0; ; y += step / view.scale) {
+    const sy = y * view.scale + view.oy;
+    if (sy > H) break;
+    ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke();
+  }
+
+  for (const room of plan.rooms || []) {
+    const col = roomColors[room.id] || '#4fc3f7';
+    ctx.beginPath();
+    room.polygon.forEach((p, i) => {
+      const [sx, sy] = toScreen(p);
+      i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy);
+    });
+    ctx.closePath();
+    ctx.fillStyle = col + '22';
+    ctx.fill();
+    ctx.strokeStyle = col;
+    ctx.lineWidth = room.id === selected ? 3 : 2;
+    ctx.stroke();
+
+    // doors / windows along walls
+    for (const o of openSpans(room)) {
+      const p0 = toScreen([o.a[0] + (o.b[0] - o.a[0]) * o.span[0] / o.L,
+                           o.a[1] + (o.b[1] - o.a[1]) * o.span[0] / o.L]);
+      const p1 = toScreen([o.a[0] + (o.b[0] - o.a[0]) * o.span[1] / o.L,
+                           o.a[1] + (o.b[1] - o.a[1]) * o.span[1] / o.L]);
+      ctx.strokeStyle = o.type === 'window' ? '#79c0ff' : '#7ee787';
+      ctx.lineWidth = 5; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(...p0); ctx.lineTo(...p1); ctx.stroke();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = '#10131a';
+      ctx.beginPath(); ctx.moveTo(...p0); ctx.lineTo(...p1); ctx.stroke();
+    }
+
+    const [cx, cy] = toScreen(centroid(room.polygon));
+    ctx.fillStyle = '#dbe3ef';
+    ctx.font = '600 12px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(room.label || room.id, cx, cy - 2);
+    ctx.fillStyle = '#8794a8';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.fillText(`${area(room.polygon).toFixed(1)} m²`, cx, cy + 12);
+  }
+
+  // scale bar (1 m)
+  const bar = view.scale;
+  ctx.strokeStyle = '#8794a8'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(16, H - 20); ctx.lineTo(16 + bar, H - 20);
+  ctx.moveTo(16, H - 24); ctx.lineTo(16, H - 16);
+  ctx.moveTo(16 + bar, H - 24); ctx.lineTo(16 + bar, H - 16);
+  ctx.stroke();
+  ctx.fillStyle = '#8794a8'; ctx.textAlign = 'left'; ctx.font = '10px ui-monospace, monospace';
+  ctx.fillText('1 m', 20 + bar, H - 17);
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (mode === '3d') return;
+  const p = toWorld(e.offsetX, e.offsetY);
+  selected = null;
+  for (const room of plan.rooms) {
+    if (inPoly(p, room.polygon)) { selected = room.id; break; }
+  }
+  if (selected) {
+    dragging = true;
+    dragStart = p;
+    roomStart = plan.rooms.find((r) => r.id === selected).polygon.map((q) => [...q]);
+  } else {
+    panning = true;
+    panStart = [e.offsetX - view.ox, e.offsetY - view.oy];
+  }
+  canvas.setPointerCapture(e.pointerId);
+  draw2D();
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (mode === '3d') return;
+  if (dragging && selected) {
+    const p = toWorld(e.offsetX, e.offsetY);
+    let dx = p[0] - dragStart[0], dy = p[1] - dragStart[1];
+    if (snapStep > 0) {
+      // snap the room's translation, not each vertex, so the shape is preserved
+      dx = Math.round(dx / snapStep) * snapStep;
+      dy = Math.round(dy / snapStep) * snapStep;
+    }
+    const room = plan.rooms.find((r) => r.id === selected);
+    room.polygon = roomStart.map(([x, y]) => [x + dx, y + dy]);
+    draw2D();
+  } else if (panning) {
+    view.ox = e.offsetX - panStart[0];
+    view.oy = e.offsetY - panStart[1];
+    draw2D();
+  }
+});
+
+const endDrag = () => { if (dragging || panning) { dragging = panning = false; rebuild3D(); } };
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+
+canvas.addEventListener('wheel', (e) => {
+  if (mode === '3d') return;
+  e.preventDefault();
+  const [wx, wy] = toWorld(e.offsetX, e.offsetY);
+  view.scale *= e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  view.scale = Math.max(4, Math.min(view.scale, 500));
+  view.ox = e.offsetX - wx * view.scale;
+  view.oy = e.offsetY - wy * view.scale;
+  draw2D();
+}, { passive: false });
+
+// ---------------------------------------------------------------------------
+// export
+// ---------------------------------------------------------------------------
+document.getElementById('snap').onclick = (e) => {
+  snapStep = snapStep > 0 ? 0 : 0.05;
+  e.target.classList.toggle('on', snapStep > 0);
+};
+document.getElementById('export').onclick = () => {
+  const blob = new Blob([JSON.stringify(plan, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'floorplan.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+document.getElementById('load').onclick = () => document.getElementById('file').click();
+document.getElementById('file').onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  applyPlan(JSON.parse(await file.text()));
+};
+
+// ---------------------------------------------------------------------------
+// 3D
+// ---------------------------------------------------------------------------
+let three = null;               // { THREE, renderer, scene, camera, ... }
+let threeFailed = false;
+
+async function init3D() {
+  if (three || threeFailed) return three;
+  try {
+    const THREE = await import('three');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x10131a);
+    scene.fog = new THREE.Fog(0x10131a, 18, 42);
+    const camera = new THREE.PerspectiveCamera(72, 1, 0.05, 200);
+    scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x2b2f3a, 1.05));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+    sun.position.set(6, 12, 4);
+    scene.add(sun);
+    const root = new THREE.Group();
+    scene.add(root);
+
+    three = { THREE, renderer, scene, camera, root, pos: new THREE.Vector3(0, 1.6, 0),
+              yaw: 0, pitch: 0, keys: new Set(), locked: false, overview: false };
+    return three;
+  } catch (err) {
+    threeFailed = true;
+    showError('3D view unavailable (three.js failed to load from CDN). The 2D editor still works.');
+    return null;
+  }
+}
+
+function clearRoot(g) {
+  while (g.children.length) {
+    const c = g.children.pop();
+    c.geometry?.dispose?.();
+    c.material?.dispose?.();
+  }
+}
+
+function rebuild3D() {
+  if (!three) return;
+  const { THREE, root } = three;
+  clearRoot(root);
+
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfd8e6, roughness: 0.92, metalness: 0 });
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x243449, roughness: 1 });
+
+  for (const room of plan.rooms || []) {
+    const H = room.ceiling || 2.7;
+    const poly = room.polygon;
+    const col = new THREE.Color(roomColors[room.id] || '#4fc3f7');
+
+    // floor
+    const shape = new THREE.Shape(poly.map(([x, y]) => new THREE.Vector2(x, y)));
+    const floor = new THREE.Mesh(new THREE.ShapeGeometry(shape), floorMat.clone());
+    floor.material.color.copy(col).multiplyScalar(0.22);
+    floor.rotation.x = Math.PI / 2;
+    floor.position.y = 0.002;
+    floor.material.side = THREE.DoubleSide;
+    root.add(floor);
+
+    // ceiling
+    const ceil = new THREE.Mesh(new THREE.ShapeGeometry(shape), wallMat.clone());
+    ceil.material.color = new THREE.Color(0x8894a8);
+    ceil.rotation.x = Math.PI / 2;
+    ceil.position.y = H;
+    ceil.material.side = THREE.DoubleSide;
+    root.add(ceil);
+
+    // walls with openings
+    const ops = openSpans(room);
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (L < 1e-6) continue;
+      const dir = [(b[0] - a[0]) / L, (b[1] - a[1]) / L];
+      const wallOps = ops.filter((o) => o.wall === i).sort((p, q) => p.span[0] - q.span[0]);
+      let cursor = 0;
+      const slabs = [];
+      for (const o of wallOps) {
+        const [s0, s1] = o.span;
+        if (s0 > cursor + 1e-4) slabs.push([cursor, s0, 0, H]);
+        slabs.push([s0, s1, o.head || 2.05, H]);           // lintel
+        if (o.type === 'window') slabs.push([s0, s1, 0, o.sill || 0.9]);
+        cursor = Math.max(cursor, s1);
+      }
+      if (cursor < L - 1e-4) slabs.push([cursor, L, 0, H]);
+
+      for (const [s0, s1, y0, y1] of slabs) {
+        const len = s1 - s0, hgt = y1 - y0;
+        if (len <= 1e-4 || hgt <= 1e-4) continue;
+        const geo = new THREE.BoxGeometry(len, hgt, 0.06);
+        const mesh = new THREE.Mesh(geo, wallMat);
+        const mid = [(a[0] + dir[0] * (s0 + s1) / 2), (a[1] + dir[1] * (s0 + s1) / 2)];
+        mesh.position.set(mid[0], y0 + hgt / 2, mid[1]);
+        mesh.rotation.y = -Math.atan2(dir[1], dir[0]);
+        root.add(mesh);
+      }
+    }
+  }
+
+  // spawn inside the first room
+  const first = (plan.rooms || [])[0];
+  if (first) {
+    const [cx, cy] = centroid(first.polygon);
+    three.pos.set(cx, 1.6, cy);
+  }
+  document.getElementById('hud').textContent =
+    `${plan.rooms.length} rooms · ${plan.rooms.reduce((s, r) => s + area(r.polygon), 0).toFixed(1)} m² · ` +
+    `${plan.rooms.reduce((s, r) => s + (r.openings || []).length, 0)} openings`;
+}
+
+function insideAnyRoom(x, z, margin = 0.22) {
+  for (const room of plan.rooms || []) {
+    if (!inPoly([x, z], room.polygon)) continue;
+    let d = Infinity;
+    const poly = room.polygon;
+    for (let i = 0; i < poly.length; i++) {
+      d = Math.min(d, distToSeg([x, z], poly[i], poly[(i + 1) % poly.length]));
+    }
+    if (d >= margin) return true;
+  }
+  return false;
+}
+
+function step3D(dt) {
+  if (!three) return;
+  const { camera, pos, keys } = three;
+  const speed = (keys.has('shift') ? 3.4 : 1.5) * dt;
+
+  if (!three.overview) {
+    let fx = 0, fz = 0;
+    if (keys.has('w')) { fx += Math.sin(three.yaw); fz += Math.cos(three.yaw); }
+    if (keys.has('s')) { fx -= Math.sin(three.yaw); fz -= Math.cos(three.yaw); }
+    if (keys.has('a')) { fx += Math.cos(three.yaw); fz -= Math.sin(three.yaw); }
+    if (keys.has('d')) { fx -= Math.cos(three.yaw); fz += Math.sin(three.yaw); }
+    const n = Math.hypot(fx, fz);
+    if (n > 0) {
+      const nx = pos.x + (fx / n) * speed;
+      const nz = pos.z + (fz / n) * speed;
+      // slide along walls instead of sticking
+      if (insideAnyRoom(nx, nz)) { pos.x = nx; pos.z = nz; }
+      else if (insideAnyRoom(nx, pos.z)) { pos.x = nx; }
+      else if (insideAnyRoom(pos.x, nz)) { pos.z = nz; }
+    }
+    camera.position.set(pos.x, pos.y, pos.z);
+    camera.rotation.set(three.pitch, three.yaw + Math.PI, 0, 'YXZ');
+  } else {
+    const b = plan.rooms.length ? plan.rooms[0].polygon : [[0, 0]];
+    const [cx, cy] = centroid(b);
+    camera.position.set(cx + 7, 11, cy + 9);
+    camera.lookAt(cx, 0, cy);
+  }
+}
+
+// pointer lock look
+canvas.addEventListener('click', async () => {
+  if (mode !== '3d' || !three) return;
+  await init3D();
+  canvas.requestPointerLock?.();
+});
+document.addEventListener('pointerlockchange', () => {
+  if (three) three.locked = document.pointerLockElement === canvas;
+});
+document.addEventListener('mousemove', (e) => {
+  if (!three || mode !== '3d' || !three.locked) return;
+  three.yaw -= e.movementX * 0.0026;
+  three.pitch = Math.max(-1.2, Math.min(1.2, three.pitch - e.movementY * 0.0026));
+});
+addEventListener('keydown', (e) => {
+  if (!three) return;
+  const k = e.key.toLowerCase();
+  three.keys.add(k);
+  if (k === 'f') three.overview = !three.overview;
+  if (['w', 'a', 's', 'd'].includes(k) && mode === '3d') e.preventDefault();
+});
+addEventListener('keyup', (e) => three?.keys.delete(e.key.toLowerCase()));
+
+// ---------------------------------------------------------------------------
+// mode switching + loop
+// ---------------------------------------------------------------------------
+function setMode(next) {
+  mode = next;
+  document.getElementById('mode2d').classList.toggle('on', next === '2d');
+  document.getElementById('mode3d').classList.toggle('on', next === '3d');
+  document.getElementById('hint2d').hidden = next !== '2d';
+  document.getElementById('hint3d').hidden = next !== '3d';
+  resize();
+  if (next === '3d') init3D().then(rebuild3D);
+}
+document.getElementById('mode2d').onclick = () => setMode('2d');
+document.getElementById('mode3d').onclick = () => setMode('3d');
+
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(r.width * devicePixelRatio));
+  canvas.height = Math.max(1, Math.floor(r.height * devicePixelRatio));
+  if (three) {
+    three.renderer.setSize(canvas.width, canvas.height, false);
+    three.camera.aspect = canvas.width / Math.max(1, canvas.height);
+    three.camera.updateProjectionMatrix();
+  }
+  if (mode === '2d') { fitView(); draw2D(); }
+}
+addEventListener('resize', resize);
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (mode === '2d') {
+    // 2D only needs redraws on interaction
+  } else if (three) {
+    step3D(dt);
+    three.renderer.render(three.scene, three.camera);
+  }
+  requestAnimationFrame(loop);
+}
+
+function showError(msg) {
+  const el = document.getElementById('err');
+  el.style.display = 'grid';
+  el.textContent = msg;
+}
+
+// ---------------------------------------------------------------------------
+// boot
+// ---------------------------------------------------------------------------
+(async function boot() {
+  try {
+    await loadPlan(SRC);
+    document.getElementById('hud').textContent = 'ready';
+  } catch (err) {
+    document.getElementById('hud').textContent = 'could not load floorplan';
+    showError(`Could not load ${SRC}: ${err.message}\n\nRun: python -m pin3d.cli stub --out examples\nThen serve this folder over HTTP (fetch() does not work from file://).`);
+  }
+  resize();
+  draw2D();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

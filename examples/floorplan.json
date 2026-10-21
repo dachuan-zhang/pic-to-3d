@@ -1,0 +1,131 @@
+{
+  "units": "meters",
+  "scale": 1.0,
+  "rooms": [
+    {
+      "id": "r_living",
+      "label": "r_living",
+      "polygon": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          3.6,
+          0.0
+        ],
+        [
+          3.6,
+          4.0
+        ],
+        [
+          0.0,
+          4.0
+        ]
+      ],
+      "ceiling": 2.585,
+      "photos": [
+        "r_living_view0.jpg",
+        "r_living_view1.jpg"
+      ],
+      "openings": [
+        {
+          "wall": 1,
+          "t": 0.41,
+          "width": 0.877,
+          "type": "door",
+          "head": 2.05,
+          "sill": 0.0,
+          "confidence": 1.0
+        }
+      ],
+      "confidence": 0.995,
+      "meta": {
+        "method": "box_fit",
+        "angle_deg": 0.0,
+        "floor_y": 0.007,
+        "n_points": 3653,
+        "band_points": 761,
+        "dense_points": 748,
+        "wall_dist_mean": 0.017486740879837256,
+        "placement": {
+          "tx": 0.0,
+          "ty": 0.0,
+          "theta_deg": 0.0,
+          "score": 0.0
+        }
+      }
+    },
+    {
+      "id": "r_kitchen",
+      "label": "r_kitchen",
+      "polygon": [
+        [
+          7.0,
+          -0.0
+        ],
+        [
+          7.0,
+          3.0
+        ],
+        [
+          3.6,
+          3.0
+        ],
+        [
+          3.6,
+          -0.0
+        ]
+      ],
+      "ceiling": 2.584,
+      "photos": [
+        "r_kitchen_view0.jpg",
+        "r_kitchen_view1.jpg"
+      ],
+      "openings": [
+        {
+          "wall": 2,
+          "t": 0.44667,
+          "width": 0.837,
+          "type": "door",
+          "head": 2.05,
+          "sill": 0.0,
+          "confidence": 1.0
+        }
+      ],
+      "confidence": 0.997,
+      "meta": {
+        "method": "box_fit",
+        "angle_deg": 90.0,
+        "floor_y": 0.009,
+        "n_points": 2932,
+        "band_points": 677,
+        "dense_points": 675,
+        "wall_dist_mean": 0.015581988223263132,
+        "placement": {
+          "tx": -0.0141,
+          "ty": -0.0166,
+          "theta_deg": 0.0,
+          "score": -2.8906
+        }
+      }
+    }
+  ],
+  "adjacency": [
+    {
+      "from": "r_living",
+      "to": "r_kitchen",
+      "via": "r_living:1"
+    }
+  ],
+  "meta": {
+    "method": "box_fit+door_constrained_greedy",
+    "rooms": 2,
+    "overlap_area": 0,
+    "edges": 1,
+    "adjacency": "inferred",
+    "backend": "stub",
+    "views": 4,
+    "notes": []
+  }
+}

@@ -1,1 +1,135 @@
-Pictures to 3D walkthrough
+# pic-to-3d
+
+Turn a pile of property photos into an **editable floorplan** and a walkable 3D scene.
+
+v0 is a measurement harness first and a renderer second: the question it answers is *how good
+is the reconstruction*, not *how pretty is the demo*. Design rationale, decisions and open
+questions live in **[docs/BRAINSTORM.md](docs/BRAINSTORM.md)** — read that first.
+
+## Why floorplan-first
+
+Reconstructing a whole house as one fused mesh from sparse listing photos fails quietly and
+plausibly. So the pipeline predicts a 2D floorplan (rooms, polygons, ceiling heights, doors)
+and attaches imagery to it. That turns house-scale reconstruction into a small pose graph:
+
+```
+point cloud per room → Manhattan room box → wall-gap doors → global 2D assembly → floorplan.json
+                                                                                 ↓
+                                                              2D editor + extruded 3D walk
+```
+
+## Quickstart (no GPU, no weights, no network)
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+.venv/bin/python -m pin3d.cli stub --out examples      # synthetic house, end to end
+.venv/bin/python -m unittest discover -s tests -t .    # 81 tests
+
+# viewer needs HTTP (fetch() is blocked on file://)
+python3 -m http.server 8000
+open http://localhost:8000/viewer/floorplan.html
+```
+
+`stub` produces `examples/floorplan.json` + `examples/floorplan_gt.json` and scores one against
+the other:
+
+```
+== stub
+  rooms        pred=2 gt=2 matched=2
+  IoU          mean=1.000  over_gt=1.000
+  corners      0.000 m (symmetric chamfer)
+  ceiling      0.016 m MAE
+  doors        P=1.000 R=1.000 F1=1.000 (2 pred / 2 gt)
+  adjacency    F1=1.000
+  self-overlap 0.000 m2 (should be ~0)
+```
+
+That is the pipeline working on a **synthetic** scene. It says nothing about real photos — that
+is the next milestone, and it is the actual experiment.
+
+## Commands
+
+```bash
+python -m pin3d.cli stub --out examples            # synthetic end-to-end + scored report
+python -m pin3d.cli reconstruct --images samples/ --backend stub --out out/plan.json
+python -m pin3d.cli reconstruct --images samples/ --backend vggt  # needs torch + vggt
+python -m pin3d.cli eval    --pred out/plan.json --gt examples/floorplan_gt.json
+python -m pin3d.cli validate --plan out/plan.json
+```
+
+## Viewer
+
+`viewer/floorplan.html` — single file, no build step.
+
+- **2D plan**: metric grid, per-room area, door/window marks, drag rooms to fix the plan
+  (snap toggle), export the edited JSON.
+- **3D walk**: walls extruded with real door gaps and lintels, pointer-lock first-person camera
+  clipped to the room polygons, so you cannot walk through walls. `F` toggles an overview camera.
+
+Editing matters: automatic floorplans are never right, and a room you can fix in ten seconds
+beats a 3D scene you cannot fix at all.
+
+## What is real vs. stubbed
+
+| Component | State |
+|---|---|
+| Schema, validation, JSON round-trip | real |
+| Geometry (IoU, hull, min-area rect, rectification) | real, tested |
+| Room box fit (density filter + outer-median wall planes) | real, tested |
+| Door detection (point-cloud wall gaps) | real, tested |
+| Global 2D assembly (BFS with hints, greedy without) | real, tested |
+| Metrics vs. ground truth | real, tested |
+| Viewer (2D editor + 3D walk) | real |
+| `VGGTBackend` | wiring only — written against the published API, **never executed here** |
+| `HostedBackend` | interface only |
+| `VLMDetector` | interface only |
+| ZInD adapter | defensive best-effort; validate against your download |
+| Room clustering / identity from arbitrary photos | **not implemented** (deliberately not faked) |
+
+## Known limitations (v0)
+
+- **Manhattan world only**: orthogonal walls, flat ceiling, single floor. L-shaped rooms fit a
+  bounding box. Curved, 45°, vaulted, split-level and stairs are out of scope.
+- **Room identity is unsolved** for arbitrary photos — the stub provides per-room clouds. Until
+  clustering lands, real-photo runs collapse everything into one room.
+- **Assembly is greedy, not optimal**: brute force over 4 yaw options x door pairings, scored;
+  no global least-squares/Bundle adjustment yet. It reports residuals so you can see it struggle.
+- **Ceiling heights** are ~1–2 cm off even on synthetic data.
+- Scaling: assembly is O(rooms²) placements, fine for a house, not for a neighbourhood.
+
+## Next
+
+1. Wire a real pose+depth backend (VGGT local, or a hosted endpoint) with the npz cache.
+2. ZInD ingest → score against published baselines for real error numbers.
+3. Room clustering + identity from listing photos.
+4. Upgrade door detection (segmentation / VLM) — currently the #1 risk.
+5. Depth-parallax 2.5D per room, then 3DGS hero nodes.
+
+## Layout
+
+```
+pin3d/
+  schema.py          Floorplan / Room / Opening, validation, JSON
+  geometry.py        2D geometry (BLAS-free small-vector helpers included)
+  pipeline/
+    poses.py         PoseBackend protocol; Stub / VGGT / Hosted; npz cache
+    planes.py        cloud → room box, wall-plane estimation, wall segments
+    openings.py      wall-gap door detection + detector protocol
+    floorplan.py     per-room placements → global 2D assembly
+    reconstruct.py   orchestrator
+  eval/
+    metrics.py       IoU, corner distance, ceiling MAE, door P/R, adjacency F1
+    zind.py          ZInD annotation adapter
+  cli.py
+viewer/floorplan.html
+examples/            generated demo plan + ground truth
+tests/               81 tests, stdlib unittest
+docs/BRAINSTORM.md   design record, decisions, open questions
+```
+
+## Note on macOS
+
+numpy 2.0 + Accelerate BLAS raises spurious `divide by zero ... in matmul` warnings for
+`(N, 2) @ (2,)` even with finite input. `pin3d.geometry` routes those through BLAS-free helpers;
+the test suite runs with `-W error::RuntimeWarning` to keep it that way.

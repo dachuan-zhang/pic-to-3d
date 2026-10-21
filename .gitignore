@@ -1,0 +1,18 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# pipeline artifacts
+.cache/
+out/
+*.npz
+
+# user photos (never commit; provenance unknown)
+samples/
+
+# os
+.DS_Store

@@ -1,0 +1,90 @@
+{
+  "units": "meters",
+  "scale": 1.0,
+  "rooms": [
+    {
+      "id": "r_living",
+      "label": "living_room",
+      "polygon": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          3.6,
+          0.0
+        ],
+        [
+          3.6,
+          4.0
+        ],
+        [
+          0.0,
+          4.0
+        ]
+      ],
+      "ceiling": 2.6,
+      "photos": [],
+      "openings": [
+        {
+          "wall": 1,
+          "t": 0.4125,
+          "width": 0.9,
+          "type": "door",
+          "head": 2.05,
+          "sill": 0.0,
+          "confidence": 1.0
+        }
+      ],
+      "confidence": 1.0,
+      "meta": {}
+    },
+    {
+      "id": "r_kitchen",
+      "label": "kitchen",
+      "polygon": [
+        [
+          3.6,
+          0.0
+        ],
+        [
+          7.0,
+          0.0
+        ],
+        [
+          7.0,
+          3.0
+        ],
+        [
+          3.6,
+          3.0
+        ]
+      ],
+      "ceiling": 2.6,
+      "photos": [],
+      "openings": [
+        {
+          "wall": 3,
+          "t": 0.45,
+          "width": 0.9,
+          "type": "door",
+          "head": 2.05,
+          "sill": 0.0,
+          "confidence": 1.0
+        }
+      ],
+      "confidence": 1.0,
+      "meta": {}
+    }
+  ],
+  "adjacency": [
+    {
+      "from": "r_living",
+      "to": "r_kitchen",
+      "via": "r_living:1"
+    }
+  ],
+  "meta": {
+    "source": "stub_ground_truth"
+  }
+}

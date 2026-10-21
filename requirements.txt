@@ -1,0 +1,3 @@
+numpy>=1.24
+# Optional: exact polygon IoU on non-convex rooms. Falls back to raster sampling without it.
+shapely>=2.0
