@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -33,6 +34,7 @@ from .pipeline.real import (
     run_experiment,
 )
 from .pipeline.real import cloud_from_depth, geometry_summary
+from .viz import save_depth_png, save_rgb
 from .pipeline.reconstruct import reconstruct
 from .schema import Floorplan, Opening, Room
 
@@ -250,6 +252,13 @@ def cmd_real(args: argparse.Namespace) -> int:
             if geom is None:
                 continue
             plan = floorplan_from_geometry(geom, row.name, f"nyu_{tag}")
+            kind = "gt" if tag == "gt" else "model"
+            depth = row.extra_depths.get(kind) if hasattr(row, "extra_depths") else None
+            if depth is not None:
+                save_depth_png(str(out / f"scene{exported:02d}_{tag}_depth.png"), depth)
+                save_rgb(str(out / f"scene{exported:02d}_rgb.jpg"), row.rgb)
+                plan.meta["images"] = {"rgb": f"scene{exported:02d}_rgb.jpg",
+                                       "depth": f"scene{exported:02d}_{tag}_depth.png"}
             path = out / f"scene{exported:02d}_{tag}.json"
             plan.save(str(path))
             print(f"wrote {path}")
@@ -296,6 +305,15 @@ def cmd_photos(args: argparse.Namespace) -> int:
             print(f"  {path.name:<26} skipped: box fit failed")
             continue
         plan = floorplan_from_geometry(geom, path.name, "photo")
+        # the reconstruction is meaningless without the picture it came from: ship both
+        save_depth_png(str(out / f"{path.stem}_depth.png"), m["depth"])
+        try:
+            plan.meta["images"] = {
+                "rgb": os.path.relpath(path.resolve(), out.resolve()),
+                "depth": f"{path.stem}_depth.png",
+            }
+        except ValueError:
+            plan.meta["images"] = {"depth": f"{path.stem}_depth.png"}
         plan.meta["floor_residual_m"] = round(float(m["floor_residual"]), 3)
         plan.meta["scale_source"] = f"floor plane + {args.camera_height} m camera prior"
         dest = out / f"{path.stem}.json"

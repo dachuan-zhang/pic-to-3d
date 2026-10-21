@@ -257,6 +257,18 @@ class SceneRow:
     depth: Dict[str, Any]
     gt_geom: Optional[Dict[str, Any]]
     pred_geom: Optional[Dict[str, Any]]
+    rgb: Optional[np.ndarray] = None
+    gt_depth: Optional[np.ndarray] = None
+    model_depth: Optional[np.ndarray] = None
+
+    @property
+    def extra_depths(self) -> Dict[str, np.ndarray]:
+        out = {}
+        if self.gt_depth is not None:
+            out["gt"] = self.gt_depth
+        if self.model_depth is not None:
+            out["model"] = self.model_depth
+        return out
 
     def as_dict(self) -> Dict[str, Any]:
         def g(x: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -322,6 +334,9 @@ def run_experiment(
             depth=dm,
             gt_geom=geometry_summary(gt_cloud, detector),
             pred_geom=geometry_summary(pred_cloud, detector),
+            rgb=s.rgb,
+            gt_depth=s.depth,
+            model_depth=aligned,
         ))
 
     agg = aggregate(rows)

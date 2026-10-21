@@ -36,6 +36,12 @@
   #hud { position: absolute; left: 12px; bottom: 12px; font-size: 11px; color: var(--dim);
     background: rgba(16,19,26,.82); padding: 8px 10px; border-radius: 6px;
     border: 1px solid var(--line); pointer-events: none; }
+  #sources { position: absolute; right: 12px; bottom: 12px; width: min(340px, 38vw);
+    background: rgba(16,19,26,.92); border: 1px solid var(--line); border-radius: 8px;
+    overflow: hidden; cursor: pointer; user-select: none; }
+  #sources img { display: block; width: 100%; height: auto; }
+  #srclabel { font-size: 10px; color: var(--text); padding: 5px 8px 0; }
+  #srchint { font-size: 9px; color: var(--dim); padding: 2px 8px 6px; }
   #err { position: absolute; inset: 0; display: none; place-items: center; padding: 24px;
     text-align: center; color: var(--warn); }
   .hint { color: var(--dim); font-size: 11px; margin-top: 10px; }
@@ -49,6 +55,11 @@
     <canvas id="view2d"></canvas>
     <canvas id="view3d" hidden></canvas>
     <div id="hud">loading…</div>
+    <div id="sources" hidden>
+      <img id="srcimg" alt="source" />
+      <div id="srclabel"></div>
+      <div id="srchint">click to switch photo / depth / off</div>
+    </div>
     <div id="err"></div>
   </div>
   <div id="panel">
@@ -87,6 +98,8 @@ const params = new URLSearchParams(location.search);
 const SRC = params.get('src') || '../examples/floorplan.json';
 
 let plan = { units: 'meters', rooms: [], adjacency: [], meta: {} };
+let planUrl = null;          // base for resolving meta.images
+let sourceMode = 0;          // 0 = photo, 1 = depth
 let snapStep = 0.05;
 let mode = '2d';
 let roomColors = {};
@@ -156,10 +169,51 @@ const openSpans = (room) => {
 async function loadPlan(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  planUrl = new URL(url, location.href).href;
   applyPlan(await res.json());
 }
+
+// ---------------------------------------------------------------------------
+// source image / depth panel
+// ---------------------------------------------------------------------------
+function resolveAsset(rel) {
+  if (!rel) return null;
+  try {
+    // images live relative to the *plan file*, which may not be the page
+    return new URL(rel, planUrl || location.href).href;
+  } catch { return null; }
+}
+
+function renderSources() {
+  const box = document.getElementById('sources');
+  const img = document.getElementById('srcimg');
+  const label = document.getElementById('srclabel');
+  const meta = plan.meta || {};
+  const imgs = meta.images;
+  if (!imgs || (!imgs.rgb && !imgs.depth)) { box.hidden = true; return; }
+
+  const wantDepth = sourceMode === 1 && imgs.depth;
+  const rel = wantDepth ? imgs.depth : imgs.rgb;
+  const url = resolveAsset(rel) || resolveAsset(imgs.rgb) || resolveAsset(imgs.depth);
+  if (!url) { box.hidden = true; return; }
+
+  img.src = url;
+  const who = meta.source === 'photo' ? 'photo'
+            : meta.source === 'nyu_gt' ? 'GT depth'
+            : meta.source === 'nyu_model' ? 'model depth' : (meta.source || '');
+  label.textContent = wantDepth ? `depth (${who})` : `source photo — ${who}`;
+  box.hidden = false;
+}
+
+document.getElementById('sources')?.addEventListener('click', () => {
+  const imgs = (plan.meta || {}).images || {};
+  sourceMode = (sourceMode + 1) % 2;
+  if (sourceMode === 1 && !imgs.depth) sourceMode = 0;
+  renderSources();
+});
 function applyPlan(next) {
   plan = next;
+  renderSources();
   roomColors = {};
   (plan.rooms || []).forEach((r, i) => { roomColors[r.id] = PALETTE[i % PALETTE.length]; });
   document.getElementById('src').textContent =
@@ -354,6 +408,7 @@ document.getElementById('load').onclick = () => document.getElementById('file').
 document.getElementById('file').onchange = async (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  planUrl = null;              // loaded from disk: relative asset paths are meaningless
   applyPlan(JSON.parse(await file.text()));
 };
 
