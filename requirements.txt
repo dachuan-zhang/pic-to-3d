@@ -9,3 +9,6 @@ onnxruntime>=1.17
 pillow>=10.0
 pyarrow>=14.0      # NYU Depth V2 parquet shards
 h5py>=3.9          # NYU Depth V2 labelled .h5 files
+
+# optional: CPU SfM for the multi-view experiment
+pycolmap>=3.10

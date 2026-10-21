@@ -446,6 +446,53 @@ Two things this settles:
    tried to rescue the occluded cases; it improved some photos, made others worse, and was
    reverted. Seven images are not an evaluation set — that is what §15b's 150 rooms are for.
 
+### 15d. Multi-view, actually measured
+
+Claim under test: single views cannot recover a room, multiple views fix it.
+
+**NYU cannot answer this.** Its labelled frames are a slow handheld *pan*: of 313 verified
+pairs, **150 are classified PANORAMIC** (pure rotation, zero baseline) at every stride from 1
+to 12, and the mapper returns **6 points** from 4 images. Sampling a walk-through densely
+produced a rotation-only dataset, which is the same failure mode as listing photography.
+
+So the experiment moved to **TUM RGB-D fr1_room** — real Kinect RGB-D with ground-truth poses
+*and* metric depth. 200 synchronised frames, trajectory extent 1.13 x 1.41 x 0.19 m, baselines
+0.36-1.17 m against a 4.72 m median scene depth, view overlap 0.63-0.78.
+
+| arm | single view | 4-view fused |
+|---|---|---|
+| GT depth | 1.2 m², support 0.95, 0 doors | 8.5 m² (+620%), support 0.44, **1 door** |
+| model depth | 14.8 m², support 0.49, 0 doors | 15.5 m² (+5%), support 0.43, 0 doors |
+| held-out view | box explains **0.00** of an unseen view | **0.08** |
+
+Three findings, and the third one matters most:
+
+1. **Multi-view does what theory says** — given real baseline, the footprint grows 7x and the
+   first door appears. Coverage, not accuracy, is what one view is missing.
+2. **Single-view "wall support" is self-fulfilling and must be retired.** It reads 0.95 on a
+   1.2 m² sliver because the box *is* the min-area rectangle of exactly those points. Only
+   held-out support is meaningful, and it is ~0 for both.
+3. **The room-box abstraction is the actual blocker, not the view count.** With perfect poses
+   *and* perfect depth, a box fitted on three views still explains only 8% of a fourth. More
+   views will not fix that; a richer room model (wall planes, not a bounding rectangle) will.
+
+SfM at this scale is also weaker than "solved" implies: **5 frames fail outright, 10 frames
+register 2 with 46 points, 20 frames register 10 with 569 points.** Multi-view reconstruction
+is solved at *dataset* scale (hundreds of views); it is not solved at "five photos of a room",
+which is exactly the listing regime.
+
+Three bugs found while building this, all of the kind that silently produce wrong numbers:
+
+- **Y-flip mismatch.** ``cloud_from_depth`` flips Y for our +Y-up convention; feeding the
+  result through TUM's y-down camera pose mirrored the scene and collapsed a 3 m room to
+  0.87 m wide. The experiment now unprojects in the dataset's own convention and flips once,
+  at the end.
+- **``cam_from_world`` is a method, not a property** in pycolmap 3.13 — the wrapper raised
+  ``AttributeError`` inside a ``try`` and reported "no reconstruction" for four runs.
+- **Comparing absolute rotations across SfM and ground truth** is meaningless because SfM has
+  an arbitrary global frame; it reported 139 degrees of "error". Needs a Procrustes alignment
+  first — or, better, don't report rotation error at all until there are enough views to align.
+
 ## 16. Open questions
 
 1. **Compute** — partially answered: depth needs no GPU (ONNX on CoreML/CPU, 0.6 s/room). Still
